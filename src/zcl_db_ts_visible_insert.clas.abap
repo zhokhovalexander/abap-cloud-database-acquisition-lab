@@ -17,11 +17,11 @@ CLASS zcl_db_ts_visible_insert IMPLEMENTATION.
 
     DATA(ls_new_price) = VALUE zdb_src_price(
       client      = sy-mandt
-      product_id  = 'P1007'
+      product_id  = 'P1008'
       store_group = 'SOUTH'
-      price       = '70.00'
+      price       = '80.00'
       currency    = 'EUR'
-      created_seq = 1008
+      created_seq = 1009
       changed_at  = lv_change_at
       is_deleted  = ''
     ).
@@ -39,7 +39,7 @@ CLASS zcl_db_ts_visible_insert IMPLEMENTATION.
     COMMIT WORK.
 
     out->write(
-      |Visible INSERT committed: P1007/SOUTH, CHANGED_AT = { lv_change_at }|
+      |Visible INSERT committed: P1008/SOUTH, CHANGED_AT = { lv_change_at }|
     ).
 
   ENDMETHOD.

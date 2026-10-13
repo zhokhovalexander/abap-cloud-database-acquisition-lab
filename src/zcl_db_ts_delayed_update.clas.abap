@@ -16,7 +16,7 @@ CLASS zcl_db_ts_delayed_update IMPLEMENTATION.
     DATA(lv_change_at) = utclong_current( ).
 
     UPDATE zdb_src_price
-      SET price      = '22.00',
+      SET price      = '23.00',
           changed_at = @lv_change_at
       WHERE product_id  = 'P1002'
         AND store_group = 'SOUTH'.
@@ -30,7 +30,7 @@ CLASS zcl_db_ts_delayed_update IMPLEMENTATION.
     ENDIF.
 
     out->write(
-      |Pending UPDATE: P1002/SOUTH -> 22.00, CHANGED_AT = { lv_change_at }|
+      |Pending UPDATE: P1002/SOUTH -> 23.00, CHANGED_AT = { lv_change_at }|
     ).
 
     " Manual debugging anchor:
