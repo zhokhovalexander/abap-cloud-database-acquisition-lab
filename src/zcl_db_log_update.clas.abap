@@ -115,7 +115,7 @@ ENDIF.
     " 4. Apply business UPDATE
     "------------------------------------------------------------
     UPDATE zdb_src_price
-      SET price      = '14.00',
+      SET price      = '16.00',
           changed_at = @lv_event_at
       WHERE product_id  = 'P1001'
         AND store_group = 'SOUTH'.
@@ -145,7 +145,7 @@ ENDIF.
       product_id  = 'P1001'
       store_group = 'SOUTH'
       operation   = 'U'
-      price       = '14.00'
+      price       = '16.00'
       currency    = 'EUR'
       event_at    = lv_event_at
     ).
@@ -186,7 +186,7 @@ ENDIF.
     ENDTRY.
 
     out->write(
-      |Committed event { lv_event_seq }: P1001/SOUTH UPDATE -> 14.00.|
+      |Committed event { lv_event_seq }: P1001/SOUTH UPDATE -> 16.00.|
     ).
 
   ENDMETHOD.
