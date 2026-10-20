@@ -102,6 +102,7 @@ CLASS zcl_db_log_delta_reader IMPLEMENTATION.
         operation   = <ls_event>-operation
         price       = <ls_event>-price
         currency    = <ls_event>-currency
+  " EVENT_AT is stored in the generic acquisition timestamp field for information ONLY.
         changed_at  = <ls_event>-event_at
         acquired_at = lv_acquired_at
       ) TO lt_acq.

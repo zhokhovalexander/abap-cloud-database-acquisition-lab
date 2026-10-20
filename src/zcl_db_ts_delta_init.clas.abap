@@ -16,6 +16,9 @@ CLASS zcl_db_ts_delta_init IMPLEMENTATION.
     CONSTANTS c_source_name TYPE zdb_delta_state-source_name
       VALUE 'PRODUCT_PRICE'.
 
+    "------------------------------------------------------------
+    " 1. Determine current maximum change timestamp
+    "------------------------------------------------------------
     SELECT SINGLE
       FROM zdb_src_price
       FIELDS MAX( changed_at )
@@ -28,16 +31,37 @@ CLASS zcl_db_ts_delta_init IMPLEMENTATION.
       RETURN.
     ENDIF.
 
+
+    "------------------------------------------------------------
+    " 2. Initialize / reset timestamp delta pointer only.
+    "
+    " Existing numeric delta state for the same source
+    " is preserved.
+    "------------------------------------------------------------
     UPDATE zdb_delta_state
       SET last_changed_at = @lv_max_changed_at
       WHERE source_name = @c_source_name.
 
     IF sy-subrc <> 0.
-      out->write(
-        |Timestamp delta initialization failed. SY-SUBRC = { sy-subrc }|
+
+      DATA(ls_delta_state) = VALUE zdb_delta_state(
+        client         = sy-mandt
+        source_name    = c_source_name
+        last_changed_at = lv_max_changed_at
       ).
-      ROLLBACK WORK.
-      RETURN.
+
+      INSERT zdb_delta_state FROM @ls_delta_state.
+
+      IF sy-subrc <> 0.
+        ROLLBACK WORK.
+
+        out->write(
+          |Timestamp delta initialization failed. SY-SUBRC = { sy-subrc }|
+        ).
+
+        RETURN.
+      ENDIF.
+
     ENDIF.
 
     COMMIT WORK.

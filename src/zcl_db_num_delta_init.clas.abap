@@ -25,26 +25,41 @@ CLASS zcl_db_num_delta_init IMPLEMENTATION.
       INTO @DATA(lv_max_seq).
 
     IF lv_max_seq IS INITIAL.
-      out->write( 'Delta initialization failed: source is empty.' ).
+      out->write(
+        'Delta initialization failed: source is empty.'
+      ).
       RETURN.
     ENDIF.
 
     "------------------------------------------------------------
-    " 2. Persist initial delta pointer
+    " 2. Initialize / reset numeric delta pointer only.
+    "
+    " Existing timestamp state for the same source is preserved.
     "------------------------------------------------------------
-    DATA(ls_delta_state) = VALUE zdb_delta_state(
-  client      = sy-mandt
-  source_name = c_source_name
-  last_seq    = lv_max_seq
-).
-
-MODIFY zdb_delta_state FROM @ls_delta_state.
+    UPDATE zdb_delta_state
+      SET last_seq = @lv_max_seq
+      WHERE source_name = @c_source_name.
 
     IF sy-subrc <> 0.
-      out->write(
-        |Delta initialization failed. SY-SUBRC = { sy-subrc }|
+
+      DATA(ls_delta_state) = VALUE zdb_delta_state(
+        client      = sy-mandt
+        source_name = c_source_name
+        last_seq    = lv_max_seq
       ).
-      RETURN.
+
+      INSERT zdb_delta_state FROM @ls_delta_state.
+
+      IF sy-subrc <> 0.
+        ROLLBACK WORK.
+
+        out->write(
+          |Delta initialization failed. SY-SUBRC = { sy-subrc }|
+        ).
+
+        RETURN.
+      ENDIF.
+
     ENDIF.
 
     COMMIT WORK.

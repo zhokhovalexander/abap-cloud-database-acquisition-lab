@@ -38,12 +38,18 @@ CLASS zcl_db_ts_delta_reader IMPLEMENTATION.
     ENDIF.
 
     out->write(
-      |Current LAST_CHANGE_AT = { lv_last_change_at }|
+      |Current LAST_CHANGED_AT = { lv_last_change_at }|
     ).
 
     "------------------------------------------------------------
-    " 2. Read timestamp delta
-    "------------------------------------------------------------
+" 2. Read naive timestamp delta
+"
+" This reader intentionally uses no safety interval.
+" It demonstrates that CHANGED_AT > LAST_CHANGED_AT
+" can detect updates, but may lose changes that become
+" visible only after a delayed COMMIT.
+"------------------------------------------------------------
+
     SELECT FROM zdb_src_price
       FIELDS product_id,
              store_group,
@@ -83,7 +89,12 @@ CLASS zcl_db_ts_delta_reader IMPLEMENTATION.
 
     "------------------------------------------------------------
     " 4. Prepare acquisition persistence
+    "
+    " Source rows are ordered by CHANGED_AT ascending.
+    " Therefore the timestamp of the last processed row
+    " becomes the new delta pointer.
     "------------------------------------------------------------
+
     DATA lt_acq TYPE TABLE OF zdb_acq_price.
     DATA lv_new_last_change_at TYPE zdb_delta_state-last_changed_at.
 
@@ -104,9 +115,6 @@ CLASS zcl_db_ts_delta_reader IMPLEMENTATION.
       ) TO lt_acq.
 
       lv_new_last_change_at = <ls_source>-changed_at.
-
-      " lt_source is ordered by CHANGED_AT ascending,
-      " therefore the last processed row contains the maximum timestamp
 
     ENDLOOP.
 
@@ -149,7 +157,7 @@ CLASS zcl_db_ts_delta_reader IMPLEMENTATION.
     ).
 
     out->write(
-      |New LAST_CHANGE_AT = { lv_new_last_change_at }|
+      |New LAST_CHANGED_AT = { lv_new_last_change_at }|
     ).
 
   ENDMETHOD.

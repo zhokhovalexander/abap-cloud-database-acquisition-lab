@@ -1,4 +1,12 @@
 CLASS zcl_db_log_delta_init DEFINITION
+
+"------------------------------------------------------------
+" Initialize / reset change-log consumer pointer.
+"
+" Re-running this class intentionally resets LAST_SEQ to 1000
+" and therefore causes subsequent events to be replayed.
+"------------------------------------------------------------
+
   PUBLIC
   FINAL
   CREATE PUBLIC.

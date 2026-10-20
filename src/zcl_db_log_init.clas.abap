@@ -1,4 +1,17 @@
 CLASS zcl_db_log_init DEFINITION
+
+"------------------------------------------------------------
+" Laboratory reset of the producer-side change log.
+"
+" This class:
+" - deletes existing PRODUCT_PRICE_LOG events;
+" - resets the producer EVENT_SEQ counter to 1000.
+"
+" It does NOT reset the consumer pointer in ZDB_DELTA_STATE.
+" Run ZCL_DB_LOG_DELTA_INIT before restarting consumer tests.
+" Current business data in ZDB_SRC_PRICE is not changed. = reset producer log infrastructure
+"------------------------------------------------------------
+
   PUBLIC
   FINAL
   CREATE PUBLIC.
@@ -49,8 +62,10 @@ CLASS zcl_db_log_init IMPLEMENTATION.
     COMMIT WORK.
 
     out->write(
-      |Change log initialized. Source: { c_source_name }, LAST_EVENT_SEQ = { c_initial_event_seq }.|
-    ).
+  |Change log initialized. Source: { c_source_name }, |
+  && |LAST_EVENT_SEQ = { c_initial_event_seq }. |
+  && |Reset consumer separately with ZCL_DB_LOG_DELTA_INIT.|
+        ).
 
   ENDMETHOD.
 

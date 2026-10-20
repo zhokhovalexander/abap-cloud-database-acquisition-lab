@@ -16,10 +16,19 @@ CLASS zcl_db_ts_safe_reader IMPLEMENTATION.
     CONSTANTS:
       c_source_name          TYPE zdb_delta_state-source_name
         VALUE 'PRODUCT_PRICE_SAFE',
+
+       " Laboratory values only.
+       " In production, the upper interval must cover the bounded
+       " source transaction / visibility lag.
       c_upper_safety_seconds TYPE i
         VALUE 300 ,
+
+       " Lower safety deliberately creates an overlap and may
+       " therefore deliver the same after-image more than once.
       c_lower_safety_seconds TYPE i
         VALUE 300 .
+
+
 
     "------------------------------------------------------------
     " 1. Read current safe-delta pointer
@@ -28,7 +37,7 @@ CLASS zcl_db_ts_safe_reader IMPLEMENTATION.
       FROM zdb_delta_state
       FIELDS last_changed_at
       WHERE source_name = @c_source_name
-      INTO @DATA(lv_last_change_at).
+      INTO @DATA(lv_last_changed_at).
 
     IF sy-subrc <> 0.
       out->write(
@@ -37,7 +46,7 @@ CLASS zcl_db_ts_safe_reader IMPLEMENTATION.
       RETURN.
     ENDIF.
 
-    IF lv_last_change_at IS INITIAL.
+    IF lv_last_changed_at IS INITIAL.
       out->write( 'Safe timestamp delta is not initialized.' ).
       RETURN.
     ENDIF.
@@ -46,10 +55,10 @@ CLASS zcl_db_ts_safe_reader IMPLEMENTATION.
   " 2. Determine request boundaries
   "
   " Persistent pointer:
-  "   LAST_CHANGE_AT
+  "   LAST_CHANGED_AT
   "
   " Temporary lower boundary:
-  "   LAST_CHANGE_AT - lower safety interval
+  "   LAST_CHANGED_AT - lower safety interval
   "
   " Upper boundary:
   "   request start - upper safety interval
@@ -58,7 +67,7 @@ CLASS zcl_db_ts_safe_reader IMPLEMENTATION.
 
   DATA(lv_lower_bound) =
     utclong_add(
-      val     = lv_last_change_at
+      val     = lv_last_changed_at
       seconds = - c_lower_safety_seconds
     ).
 
@@ -69,7 +78,7 @@ CLASS zcl_db_ts_safe_reader IMPLEMENTATION.
     ).
 
   out->write(
-    |Current LAST_CHANGE_AT = { lv_last_change_at }|
+    |Current LAST_CHANGED_AT = { lv_last_changed_at }|
   ).
 
   out->write(
@@ -97,7 +106,7 @@ CLASS zcl_db_ts_safe_reader IMPLEMENTATION.
  "------------------------------------------------------------
   " 3. Check whether a new safe interval exists
   "------------------------------------------------------------
-  IF lv_upper_bound <= lv_last_change_at.
+  IF lv_upper_bound <= lv_last_changed_at.
     out->write(
       'Upper bound has not moved beyond the current pointer.'
     ).
@@ -106,11 +115,15 @@ CLASS zcl_db_ts_safe_reader IMPLEMENTATION.
 
 
   "------------------------------------------------------------
-  " 4. Read safe interval including lower overlap
-  "
-  " The interval between LOWER_BOUND and LAST_CHANGE_AT
-  " is intentionally re-read.
-  "------------------------------------------------------------
+" 4. Read safe interval including lower overlap
+"
+" LOWER_BOUND < CHANGED_AT <= UPPER_BOUND
+"
+" The interval between LOWER_BOUND and LAST_CHANGED_AT
+" is intentionally re-read. This may produce duplicate
+" after-images in different acquisition runs.
+"------------------------------------------------------------
+
   SELECT FROM zdb_src_price
     FIELDS product_id,
            store_group,
@@ -132,10 +145,11 @@ CLASS zcl_db_ts_safe_reader IMPLEMENTATION.
     "------------------------------------------------------------
     " 5. Persist acquired rows if any
     "------------------------------------------------------------
+    DATA lv_run_id TYPE sysuuid_c32.
     IF lt_source IS NOT INITIAL.
 
       TRY.
-          DATA(lv_run_id) =
+          lv_run_id =
             cl_system_uuid=>create_uuid_c32_static( ).
 
         CATCH cx_uuid_error INTO DATA(lx_uuid).
@@ -208,9 +222,22 @@ CLASS zcl_db_ts_safe_reader IMPLEMENTATION.
 
     COMMIT WORK.
 
+    IF lt_source IS NOT INITIAL.
+
+     out->write(
+         |Run ID: { lv_run_id }|
+          ).
+
+     out->write(
+         |Persisted: { lines( lt_source ) } rows.|
+        ).
+
+    ENDIF.
+
     out->write(
-      |New LAST_CHANGE_AT = { lv_upper_bound }|
-    ).
+        |New LAST_CHANGED_AT = { lv_upper_bound }|
+        ).
+
 
   ENDMETHOD.
 

@@ -8,13 +8,24 @@ CLASS zcl_db_log_insert DEFINITION
 
 ENDCLASS.
 
-
 CLASS zcl_db_log_insert IMPLEMENTATION.
 
-  METHOD if_oo_adt_classrun~main.
+METHOD if_oo_adt_classrun~main.
 
-    DATA lv_client TYPE zdb_event_count-client.
-    DATA lv_source_name TYPE zdb_event_count-source_name.
+ CONSTANTS:
+  c_product_id  TYPE zdb_src_price-product_id
+    VALUE 'P1011',
+  c_store_group TYPE zdb_src_price-store_group
+    VALUE 'SOUTH',
+  c_price       TYPE zdb_src_price-price
+    VALUE '110.00',
+  c_currency    TYPE zdb_src_price-currency
+    VALUE 'EUR',
+  c_operation   TYPE zdb_change_log-operation
+    VALUE 'I'.
+
+  DATA lv_client TYPE zdb_event_count-client.
+  DATA lv_source_name TYPE zdb_event_count-source_name.
 
     lv_client      = sy-mandt.
     lv_source_name = 'PRODUCT_PRICE_LOG'.
@@ -134,16 +145,17 @@ CLASS zcl_db_log_insert IMPLEMENTATION.
     "------------------------------------------------------------
     " 5. Apply business change
     "------------------------------------------------------------
-    DATA(ls_price) = VALUE zdb_src_price(
-      client      = sy-mandt
-      product_id  = 'P1011'
-      store_group = 'SOUTH'
-      price       = '110.00'
-      currency    = 'EUR'
-      created_seq = 1012
-      changed_at  = lv_event_at
-      is_deleted  = ''
-    ).
+   DATA(ls_price) = VALUE zdb_src_price(
+     client      = lv_client
+     product_id  = c_product_id
+     store_group = c_store_group
+     price       = c_price
+     currency    = c_currency
+" Current-state creation sequence; not used by change-log delta.
+     created_seq = 1012
+     changed_at  = lv_event_at
+     is_deleted  = ''
+     ).
 
     INSERT zdb_src_price FROM @ls_price.
 
@@ -169,16 +181,16 @@ CLASS zcl_db_log_insert IMPLEMENTATION.
     " 6. Write change-log event
     "------------------------------------------------------------
     DATA(ls_event) = VALUE zdb_change_log(
-      client      = sy-mandt
+      client      = lv_client
       source_name = lv_source_name
       event_seq   = lv_event_seq
-      product_id  = 'P1011'
-      store_group = 'SOUTH'
-      operation   = 'I'
-      price       = '110.00'
-      currency    = 'EUR'
+      product_id  = c_product_id
+      store_group = c_store_group
+      operation   = c_operation
+      price       = c_price
+      currency    = c_currency
       event_at    = lv_event_at
-    ).
+      ).
 
     INSERT zdb_change_log FROM @ls_event.
 
@@ -238,8 +250,8 @@ CLASS zcl_db_log_insert IMPLEMENTATION.
 
 
     out->write(
-      |Committed event { lv_event_seq }: P1011/SOUTH INSERT.|
-    ).
+      |Committed event { lv_event_seq }: { c_product_id }/{ c_store_group } INSERT.|
+      ).
 
   ENDMETHOD.
 

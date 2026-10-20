@@ -19,6 +19,7 @@ CLASS zcl_db_log_delete IMPLEMENTATION.
     lv_client      = sy-mandt.
     lv_source_name = 'PRODUCT_PRICE_LOG'.
 
+
     "------------------------------------------------------------
     " 1. Get lock object
     "------------------------------------------------------------
@@ -76,18 +77,18 @@ CLASS zcl_db_log_delete IMPLEMENTATION.
 
     IF sy-subrc <> 0.
 
-  ROLLBACK WORK.
+      ROLLBACK WORK.
 
-  TRY.
-      lo_lock->dequeue( ).
-    CATCH cx_abap_lock_failure.
-      " Nothing else to do in this error branch
-  ENDTRY.
+      TRY.
+          lo_lock->dequeue( ).
+        CATCH cx_abap_lock_failure.
+          " Nothing else to do in this error branch
+      ENDTRY.
 
-  out->write( 'Event counter not found.' ).
-  RETURN.
+      out->write( 'Event counter not found.' ).
+      RETURN.
 
-ENDIF.
+    ENDIF.
 
     DATA(lv_event_seq) = lv_last_event_seq + 1.
     DATA(lv_event_at)  = utclong_current( ).
@@ -98,72 +99,74 @@ ENDIF.
 
     IF sy-subrc <> 0.
 
-  ROLLBACK WORK.
+      ROLLBACK WORK.
 
-  TRY.
-      lo_lock->dequeue( ).
-    CATCH cx_abap_lock_failure.
-  ENDTRY.
+      TRY.
+          lo_lock->dequeue( ).
+        CATCH cx_abap_lock_failure.
+      ENDTRY.
 
-  out->write( 'Event counter update failed.' ).
-  RETURN.
+      out->write( 'Event counter update failed.' ).
+      RETURN.
 
-ENDIF.
-
-
-"------------------------------------------------------------
-" 4. Physical DELETE from current-state table
-"------------------------------------------------------------
-DELETE FROM zdb_src_price
-  WHERE product_id  = 'P1010'
-    AND store_group = 'SOUTH'.
-
-IF sy-subrc <> 0.
-
-  ROLLBACK WORK.
-
-  TRY.
-      lo_lock->dequeue( ).
-    CATCH cx_abap_lock_failure.
-  ENDTRY.
-
-  out->write( 'Source DELETE failed.' ).
-  RETURN.
-
-ENDIF.
+    ENDIF.
 
 
-"------------------------------------------------------------
-" 5. Write DELETE event
-"------------------------------------------------------------
-DATA(ls_event) = VALUE zdb_change_log(
-  client      = sy-mandt
-  source_name = lv_source_name
-  event_seq   = lv_event_seq
-  product_id  = 'P1010'
-  store_group = 'SOUTH'
-  operation   = 'D'
-  event_at    = lv_event_at
-).
-
-INSERT zdb_change_log FROM @ls_event.
+    "------------------------------------------------------------
+    " 4. Physical DELETE from current-state table
+    "------------------------------------------------------------
+    DELETE FROM zdb_src_price
+      WHERE product_id  = 'P1010'
+        AND store_group = 'SOUTH'.
 
     IF sy-subrc <> 0.
 
-  ROLLBACK WORK.
+      ROLLBACK WORK.
 
-  TRY.
-      lo_lock->dequeue( ).
-    CATCH cx_abap_lock_failure.
-  ENDTRY.
+      TRY.
+          lo_lock->dequeue( ).
+        CATCH cx_abap_lock_failure.
+      ENDTRY.
 
-  out->write( 'Change-log INSERT failed.' ).
-  RETURN.
+      out->write( 'Source DELETE failed.' ).
+      RETURN.
 
-ENDIF.
+    ENDIF.
 
 
+    "------------------------------------------------------------
+    " 5. Write DELETE event
+    "------------------------------------------------------------
+    DATA(ls_event) = VALUE zdb_change_log(
+      client      = lv_client
+      source_name = lv_source_name
+      event_seq   = lv_event_seq
+      product_id  = 'P1010'
+      store_group = 'SOUTH'
+      operation   = 'D'
+      event_at    = lv_event_at
+    ).
+
+    INSERT zdb_change_log FROM @ls_event.
+
+    IF sy-subrc <> 0.
+
+      ROLLBACK WORK.
+
+      TRY.
+          lo_lock->dequeue( ).
+        CATCH cx_abap_lock_failure.
+      ENDTRY.
+
+      out->write( 'Change-log INSERT failed.' ).
+      RETURN.
+
+    ENDIF.
+
+
+    "------------------------------------------------------------
     " Manual debugging anchor
+    "------------------------------------------------------------
     DATA(lv_debug_anchor) = abap_true.
 
 
@@ -174,6 +177,7 @@ ENDIF.
 
     TRY.
         lo_lock->dequeue( ).
+
       CATCH cx_abap_lock_failure INTO DATA(lx_dequeue).
         out->write(
           |Commit succeeded, but lock release failed: { lx_dequeue->get_text( ) }|
@@ -182,7 +186,7 @@ ENDIF.
     ENDTRY.
 
     out->write(
-      |Committed event { lv_event_seq }: P1001/SOUTH UPDATE -> 14.00.|
+      |Committed event { lv_event_seq }: P1010/SOUTH DELETE.|
     ).
 
   ENDMETHOD.

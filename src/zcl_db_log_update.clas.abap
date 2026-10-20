@@ -13,6 +13,19 @@ CLASS zcl_db_log_update IMPLEMENTATION.
 
   METHOD if_oo_adt_classrun~main.
 
+
+  CONSTANTS:
+  c_product_id  TYPE zdb_src_price-product_id
+    VALUE 'P1001',
+  c_store_group TYPE zdb_src_price-store_group
+    VALUE 'SOUTH',
+  c_price       TYPE zdb_src_price-price
+    VALUE '16.00',
+  c_currency    TYPE zdb_src_price-currency
+    VALUE 'EUR',
+  c_operation   TYPE zdb_change_log-operation
+    VALUE 'U'.
+
     DATA lv_client      TYPE zdb_event_count-client.
     DATA lv_source_name TYPE zdb_event_count-source_name.
 
@@ -97,77 +110,85 @@ ENDIF.
       WHERE source_name = @lv_source_name.
 
     IF sy-subrc <> 0.
+        ROLLBACK WORK.
 
-  ROLLBACK WORK.
+        TRY.
+            lo_lock->dequeue( ).
+        CATCH cx_abap_lock_failure.
+        ENDTRY.
 
-  TRY.
-      lo_lock->dequeue( ).
-    CATCH cx_abap_lock_failure.
-  ENDTRY.
+        out->write( 'Event counter update failed.' ).
+        RETURN.
 
-  out->write( 'Event counter update failed.' ).
-  RETURN.
-
-ENDIF.
+    ENDIF.
 
 
     "------------------------------------------------------------
     " 4. Apply business UPDATE
     "------------------------------------------------------------
     UPDATE zdb_src_price
-      SET price      = '16.00',
-          changed_at = @lv_event_at
-      WHERE product_id  = 'P1001'
-        AND store_group = 'SOUTH'.
+         SET price      = @c_price,
+           currency   = @c_currency,
+           changed_at = @lv_event_at
+         WHERE product_id  = @c_product_id
+         AND store_group = @c_store_group.
 
     IF sy-subrc <> 0.
+        ROLLBACK WORK.
 
-  ROLLBACK WORK.
-
-  TRY.
+    TRY.
       lo_lock->dequeue( ).
     CATCH cx_abap_lock_failure.
-  ENDTRY.
+    ENDTRY.
 
-  out->write( 'Source UPDATE failed.' ).
-  RETURN.
+    out->write( 'Source UPDATE failed.' ).
+    RETURN.
 
-ENDIF.
+    ENDIF.
 
 
     "------------------------------------------------------------
     " 5. Write U event
     "------------------------------------------------------------
     DATA(ls_event) = VALUE zdb_change_log(
-      client      = sy-mandt
+      client      = lv_client
       source_name = lv_source_name
       event_seq   = lv_event_seq
-      product_id  = 'P1001'
-      store_group = 'SOUTH'
-      operation   = 'U'
-      price       = '16.00'
-      currency    = 'EUR'
+      product_id  = c_product_id
+      store_group = c_store_group
+      operation   = c_operation
+      price       = c_price
+      currency    = c_currency
       event_at    = lv_event_at
-    ).
+        ).
 
     INSERT zdb_change_log FROM @ls_event.
 
     IF sy-subrc <> 0.
+        ROLLBACK WORK.
 
-  ROLLBACK WORK.
-
-  TRY.
+    TRY.
       lo_lock->dequeue( ).
     CATCH cx_abap_lock_failure.
-  ENDTRY.
+    ENDTRY.
 
-  out->write( 'Change-log INSERT failed.' ).
-  RETURN.
+    out->write( 'Change-log INSERT failed.' ).
+     RETURN.
 
-ENDIF.
+    ENDIF.
 
 
-    " Manual debugging anchor
+    "------------------------------------------------------------
+" Manual debugging anchor
+"
+" At this point:
+" - EZDBEVCOUNT is still locked
+" - counter change is uncommitted
+" - business UPDATE is uncommitted
+" - change-log INSERT is uncommitted
+"
+" Do NOT move the DEQUEUE before COMMIT.
+"------------------------------------------------------------
     DATA(lv_debug_anchor) = abap_true.
 
 
@@ -185,9 +206,10 @@ ENDIF.
         RETURN.
     ENDTRY.
 
-    out->write(
-      |Committed event { lv_event_seq }: P1001/SOUTH UPDATE -> 16.00.|
-    ).
+   out->write(
+     |Committed event { lv_event_seq }: |
+     && |{ c_product_id }/{ c_store_group } UPDATE -> { c_price }.|
+     ).
 
   ENDMETHOD.
 

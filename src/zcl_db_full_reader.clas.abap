@@ -77,14 +77,26 @@ CLASS zcl_db_full_reader IMPLEMENTATION.
   "------------------------------------------------------------
   INSERT zdb_acq_price FROM TABLE @lt_acq.
 
-  out->write(
-    |Run ID: { lv_run_id }|
-  ).
+    IF sy-subrc <> 0.
+        ROLLBACK WORK.
 
-  out->write(
-    |Persisted: { lines( lt_acq ) } rows.|
-  ).
+        out->write(
+            |FULL acquisition persistence failed. SY-SUBRC = { sy-subrc }|
+            ).
 
-ENDMETHOD.
+        RETURN.
+    ENDIF.
+
+    COMMIT WORK.
+
+    out->write(
+        |Run ID: { lv_run_id }|
+        ).
+
+    out->write(
+        |Persisted: { lines( lt_acq ) } rows.|
+        ).
+
+ ENDMETHOD.
 
 ENDCLASS.

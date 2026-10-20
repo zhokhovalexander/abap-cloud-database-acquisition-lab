@@ -38,6 +38,9 @@ CLASS zcl_db_num_delta_reader IMPLEMENTATION.
 
     "------------------------------------------------------------
     " 2. Read numeric delta
+    " Numeric delta is based on the creation sequence.
+    " It detects newly created rows but cannot detect updates
+    " to rows whose CREATED_SEQ remains unchanged.
     "------------------------------------------------------------
     SELECT FROM zdb_src_price
       FIELDS product_id,
@@ -77,8 +80,12 @@ CLASS zcl_db_num_delta_reader IMPLEMENTATION.
     DATA(lv_acquired_at) = utclong_current( ).
 
     "------------------------------------------------------------
-    " 4. Prepare acquisition persistence
-    "------------------------------------------------------------
+" 4. Prepare acquisition persistence
+"
+" Source rows are ordered by CREATED_SEQ ascending,
+" therefore the last processed CREATED_SEQ becomes
+" the new numeric delta pointer.
+"------------------------------------------------------------
     DATA lt_acq TYPE TABLE OF zdb_acq_price.
     DATA lv_new_last_seq TYPE zdb_delta_state-last_seq.
 
