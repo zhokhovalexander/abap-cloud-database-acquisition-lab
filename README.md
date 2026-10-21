@@ -2941,8 +2941,2387 @@ ZCL_DB_LOG_FAIL_CLEANUP
 
 ## How to Run
 
+## How to Run
+
+The project is intended to be executed as a sequence of controlled laboratory experiments.
+
+It is not a single end-to-end application.
+
+Individual classes intentionally modify or reset source data, delta pointers, event counters, and acquisition history. Run them in the documented order when reproducing a specific experiment.
+
+### Prerequisites
+
+The project requires:
+
+```text
+SAP BTP ABAP Environment / ABAP Cloud system
+Eclipse with ABAP Development Tools
+abapGit integration for ADT
+```
+
+The repository should be linked to an ABAP package, for example:
+
+```text
+ZDB_ACQ_LAB
+```
+
+After importing the repository, activate all ABAP objects before running the experiments.
+
+The project uses only ABAP Cloud database tables and classes.
+
+No external database connection or SAP BW runtime is required.
+
+---
+
+### 1. Initialize the Source
+
+Start with:
+
+```text
+ZCL_DB_SOURCE_INIT
+```
+
+This resets `ZDB_SRC_PRICE` and creates the initial current-state data set.
+
+Expected baseline:
+
+```text
+P1001/SOUTH  10.00  CREATED_SEQ 1001
+P1002/SOUTH  20.00  CREATED_SEQ 1002
+P1003/SOUTH  30.00  CREATED_SEQ 1003
+P1001/NORTH  11.50  CREATED_SEQ 1004
+```
+
+`CHANGED_AT` is intentionally left initial.
+
+---
+
+### 2. Full Extraction
+
+Run:
+
+```text
+ZCL_DB_FULL_READER
+```
+
+The class reads the complete source table and persists the extracted rows in:
+
+```text
+ZDB_ACQ_PRICE
+```
+
+Each execution receives a new `RUN_ID`.
+
+Running the class repeatedly therefore produces independent acquisition snapshots.
+
+---
+
+### 3. Numeric Delta Experiment
+
+Initialize the numeric pointer:
+
+```text
+ZCL_DB_NUM_DELTA_INIT
+```
+
+Expected state:
+
+```text
+PRODUCT_PRICE
+LAST_SEQ = 1004
+```
+
+Prepare the source changes:
+
+```text
+ZCL_DB_SOURCE_UPDATE
+```
+
+This performs:
+
+```text
+INSERT P1004/SOUTH
+CREATED_SEQ = 1005
+```
+
+and:
+
+```text
+UPDATE P1001/SOUTH
+PRICE 10.00 -> 12.00
+CREATED_SEQ remains 1001
+```
+
+Then run:
+
+```text
+ZCL_DB_NUM_DELTA_READER
+```
+
+Expected result:
+
+```text
+P1004/SOUTH -> acquired
+P1001/SOUTH -> not acquired
+```
+
+The consumer pointer should advance to:
+
+```text
+LAST_SEQ = 1005
+```
+
+---
+
+### 4. Prepare Timestamp Delta
+
+Assign a common timestamp baseline:
+
+```text
+ZCL_DB_TS_SOURCE_PREP
+```
+
+Then initialize the timestamp pointer:
+
+```text
+ZCL_DB_TS_DELTA_INIT
+```
+
+Expected state:
+
+```text
+PRODUCT_PRICE
+LAST_CHANGED_AT = baseline timestamp
+```
+
+Prepare timestamp-based source changes:
+
+```text
+ZCL_DB_TS_SOURCE_UPDATE
+```
+
+This performs:
+
+```text
+UPDATE P1001/SOUTH
+INSERT P1005/SOUTH
+```
+
+with the same new `CHANGED_AT`.
+
+Run:
+
+```text
+ZCL_DB_TS_DELTA_READER
+```
+
+Expected result:
+
+```text
+2 rows selected
+```
+
+Both the insert and the update should be acquired.
+
+---
+
+### 5. Reproduce the Delayed-COMMIT Failure
+
+This experiment requires two independent Eclipse / ADT sessions connected to the same ABAP Cloud system.
+
+Use:
+
+```text
+Session A
+Session B
+```
+
+In `ZCL_DB_TS_DELAYED_UPDATE`, set a breakpoint at the manual debugging anchor immediately before:
+
+```text
+COMMIT WORK
+```
+
+In Session B, run:
+
+```text
+ZCL_DB_TS_DELAYED_UPDATE
+```
+
+The class updates `P1002/SOUTH`, assigns:
+
+```text
+CHANGED_AT = T1
+```
+
+and stops before commit.
+
+Leave Session B suspended.
+
+In Session A, run:
+
+```text
+ZCL_DB_TS_VISIBLE_INSERT
+```
+
+This creates and immediately commits a later source change:
+
+```text
+P1008/SOUTH
+CHANGED_AT = T2
+```
+
+where:
+
+```text
+T1 < T2
+```
+
+Still in Session A, run:
+
+```text
+ZCL_DB_TS_DELTA_READER
+```
+
+The naive reader should see the committed row at `T2` but not the uncommitted row at `T1`.
+
+The pointer advances to:
+
+```text
+LAST_CHANGED_AT = T2
+```
+
+Now return to Session B and continue execution through:
+
+```text
+COMMIT WORK
+```
+
+Run `ZCL_DB_TS_DELTA_READER` again in Session A.
+
+Expected result:
+
+```text
+0 rows selected
+```
+
+The committed `P1002/SOUTH` change is now behind the timestamp pointer and is lost to the naive delta algorithm.
+
+---
+
+### 6. Initialize the Safe Timestamp Reader
+
+Run:
+
+```text
+ZCL_DB_TS_SAFE_INIT
+```
+
+This creates or resets the independent state:
+
+```text
+PRODUCT_PRICE_SAFE
+```
+
+using the current timestamp pointer of:
+
+```text
+PRODUCT_PRICE
+```
+
+---
+
+### 7. Upper and Lower Safety Intervals
+
+Run:
+
+```text
+ZCL_DB_TS_SAFE_READER
+```
+
+The laboratory implementation uses:
+
+```text
+UPPER_SAFETY_INTERVAL = 300 seconds
+LOWER_SAFETY_INTERVAL = 300 seconds
+```
+
+These values are for demonstration only.
+
+The reader calculates:
+
+```text
+LOWER_BOUND =
+LAST_CHANGED_AT - 300 seconds
+
+UPPER_BOUND =
+REQUEST_START - 300 seconds
+```
+
+and selects:
+
+```text
+LOWER_BOUND < CHANGED_AT <= UPPER_BOUND
+```
+
+To reproduce the upper-safety experiment, repeat the two-session delayed-COMMIT scenario using:
+
+```text
+ZCL_DB_TS_DELAYED_UPDATE
+ZCL_DB_TS_VISIBLE_INSERT
+```
+
+but run:
+
+```text
+ZCL_DB_TS_SAFE_READER
+```
+
+instead of the naive reader.
+
+While both source changes are still inside the upper safety zone, they should not yet be acquired.
+
+After the delayed transaction commits and enough time has passed for both timestamps to move behind `UPPER_BOUND`, run the safe reader again.
+
+Expected result:
+
+```text
+both rows acquired
+```
+
+To observe lower-safety overlap, run the safe reader again after the pointer has advanced.
+
+Rows whose `CHANGED_AT` falls between:
+
+```text
+LOWER_BOUND
+```
+
+and:
+
+```text
+LAST_CHANGED_AT
+```
+
+may be acquired again under a new `RUN_ID`.
+
+This duplicate acquisition is intentional.
+
+---
+
+### 8. Physical DELETE Experiment
+
+If necessary, reinitialize the source first.
+
+Run:
+
+```text
+ZCL_DB_PHYSICAL_DELETE
+```
+
+This physically removes:
+
+```text
+P1003/SOUTH
+```
+
+from `ZDB_SRC_PRICE`.
+
+Then run:
+
+```text
+ZCL_DB_TS_SAFE_READER
+```
+
+Expected result:
+
+```text
+no deletion record is acquired
+```
+
+The physical delete is invisible because no source row remains.
+
+---
+
+### 9. Soft DELETE Experiment
+
+Restore the deleted row:
+
+```text
+ZCL_DB_SOFT_DELETE_PREP
+```
+
+Then run:
+
+```text
+ZCL_DB_SOFT_DELETE
+```
+
+The row remains present with:
+
+```text
+IS_DELETED = 'X'
+CHANGED_AT = current timestamp
+```
+
+After the row has moved behind the configured upper safety boundary, run:
+
+```text
+ZCL_DB_TS_SAFE_READER
+```
+
+Expected result:
+
+```text
+P1003/SOUTH acquired
+IS_DELETED = X
+```
+
+---
+
+### 10. Initialize the Transactional Change Log
+
+Reset the producer-side log infrastructure:
+
+```text
+ZCL_DB_LOG_INIT
+```
+
+This:
+
+```text
+deletes PRODUCT_PRICE_LOG events
+resets ZDB_EVENT_COUNT to 1000
+```
+
+It does not reset the consumer pointer.
+
+Initialize the change-log consumer separately:
+
+```text
+ZCL_DB_LOG_DELTA_INIT
+```
+
+Expected states:
+
+```text
+Producer:
+LAST_EVENT_SEQ = 1000
+
+Consumer:
+LAST_SEQ = 1000
+```
+
+---
+
+### 11. Produce Change-Log Events
+
+Run the producer classes as required:
+
+```text
+ZCL_DB_LOG_INSERT
+ZCL_DB_LOG_UPDATE
+ZCL_DB_LOG_DELETE
+```
+
+They generate explicit events:
+
+```text
+I
+U
+D
+```
+
+in:
+
+```text
+ZDB_CHANGE_LOG
+```
+
+Each producer transaction follows:
+
+```text
+lock counter
+allocate EVENT_SEQ
+update counter
+apply business change
+insert log event
+COMMIT
+release lock
+```
+
+Inspect:
+
+```text
+ZDB_EVENT_COUNT
+ZDB_SRC_PRICE
+ZDB_CHANGE_LOG
+```
+
+after each run.
+
+---
+
+### 12. Consume the Change Log
+
+Run:
+
+```text
+ZCL_DB_LOG_DELTA_READER
+```
+
+The consumer selects:
+
+```text
+EVENT_SEQ > LAST_SEQ
+ORDER BY EVENT_SEQ
+```
+
+and persists the events in:
+
+```text
+ZDB_ACQ_PRICE
+```
+
+After a successful run, inspect:
+
+```text
+ZDB_DELTA_STATE
+```
+
+and verify that:
+
+```text
+LAST_SEQ
+```
+
+has advanced to the highest successfully acquired `EVENT_SEQ`.
+
+---
+
+### 13. Producer Concurrency Experiment
+
+Use two independent Eclipse / ADT sessions.
+
+Set a breakpoint at the manual debugging anchor in one producer class, for example:
+
+```text
+ZCL_DB_LOG_UPDATE
+```
+
+Session A:
+
+```text
+run producer
+allocate next EVENT_SEQ
+stop before COMMIT
+hold EZDBEVCOUNT
+```
+
+While Session A is suspended, run another producer in Session B:
+
+```text
+ZCL_DB_LOG_INSERT
+```
+
+Expected result:
+
+```text
+Event counter is locked by another session
+```
+
+Session B must not allocate the next event sequence.
+
+Resume Session A and allow it to commit.
+
+Then run Session B again.
+
+It should now receive the next sequence and commit successfully.
+
+---
+
+### 14. Consumer Restart Experiment
+
+Create one or more committed producer events that have not yet been consumed.
+
+Set a breakpoint in:
+
+```text
+ZCL_DB_LOG_DELTA_READER
+```
+
+after:
+
+```text
+INSERT zdb_acq_price FROM TABLE ...
+```
+
+but before:
+
+```text
+UPDATE zdb_delta_state
+```
+
+Run the consumer and terminate the debug session before `COMMIT`.
+
+Verify:
+
+```text
+ZDB_CHANGE_LOG
+-> producer events still exist
+
+ZDB_ACQ_PRICE
+-> interrupted acquisition rows are not committed
+
+ZDB_DELTA_STATE
+-> LAST_SEQ has not advanced
+```
+
+Run the consumer again without interruption.
+
+The same events should be selected again and committed successfully.
+
+---
+
+### 15. Producer Rollback Experiment
+
+Prepare an artificial change-log conflict:
+
+```text
+ZCL_DB_LOG_FAIL_PREP
+```
+
+This creates a deliberate record for the next producer `EVENT_SEQ`.
+
+Run:
+
+```text
+ZCL_DB_LOG_UPDATE
+```
+
+The producer should:
+
+```text
+advance the counter in its LUW
+apply the business change
+fail when inserting the duplicate log event
+ROLLBACK
+```
+
+Verify that after rollback:
+
+```text
+ZDB_EVENT_COUNT
+-> restored to its previous value
+
+ZDB_SRC_PRICE
+-> business value restored
+
+ZDB_CHANGE_LOG
+-> no legitimate event was created
+```
+
+Remove the artificial conflict:
+
+```text
+ZCL_DB_LOG_FAIL_CLEANUP
+```
+
+Run the producer again.
+
+The same event sequence should now be reused successfully.
+
+Finally run:
+
+```text
+ZCL_DB_LOG_DELTA_READER
+```
+
+and verify that the successfully committed event reaches `ZDB_ACQ_PRICE`.
+
+---
+
+### Inspecting Results
+
+The most useful tables to inspect during the experiments are:
+
+```text
+ZDB_SRC_PRICE
+-> current source state
+
+ZDB_ACQ_PRICE
+-> rows actually acquired by each run
+
+ZDB_DELTA_STATE
+-> consumer delta pointers
+
+ZDB_EVENT_COUNT
+-> producer event-sequence state
+
+ZDB_CHANGE_LOG
+-> durable I / U / D event stream
+```
+
+For acquisition history, compare:
+
+```text
+RUN_ID
+LOAD_TYPE
+EVENT_SEQ
+OPERATION
+PRODUCT_ID
+STORE_GROUP
+PRICE
+CHANGED_AT
+IS_DELETED
+```
+
+to see exactly what each extraction strategy returned.
+
+---
+
+### Important
+
+Several classes are destructive laboratory utilities.
+
+They may:
+
+```text
+delete source rows
+reset delta pointers
+reset event counters
+delete change-log events
+replay previously consumed events
+```
+
+Run them only in the intended experimental sequence.
+
+The project is designed for a disposable ABAP Cloud laboratory environment, not for production business data.
+
+
 ## Mapping to SAP BW DB Connect
+
+This project does not implement the SAP BW DB Connect runtime.
+
+Instead, it isolates and reproduces the source-side and consumer-side semantics that determine whether a database delta can be acquired reliably.
+
+The laboratory objects can therefore be mapped only **conceptually** to classical SAP BW DB Connect components.
+
+### High-Level Mapping
+
+A classical DB Connect flow can be represented as:
+
+```text
+External relational database
+        |
+        | table / view
+        v
+DB Connect source system
+        |
+        v
+DataSource
+        |
+        v
+InfoPackage
+        |
+        v
+PSA / acquisition layer
+        |
+        v
+Transformation / DTP
+        |
+        v
+BW target
+```
+
+The laboratory models mainly the upper part of this flow:
+
+```text
+database source
+        |
+        v
+delta selection
+        |
+        v
+acquisition persistence
+        |
+        v
+delta pointer advancement
+```
+
+The corresponding conceptual mapping is:
+
+| Laboratory object / mechanism | SAP BW DB Connect concept |
+|---|---|
+| `ZDB_SRC_PRICE` | External database table or view |
+| `ZCL_DB_FULL_READER` | Full extraction through a DB Connect DataSource |
+| `CREATED_SEQ` delta | Generic numeric delta criterion |
+| `CHANGED_AT` delta | Generic date/timestamp delta criterion |
+| Upper / lower safety intervals | Generic delta safety intervals |
+| `ZDB_ACQ_PRICE` | Conceptually similar to an acquisition / PSA persistence layer |
+| `ZDB_DELTA_STATE` | Laboratory replacement for BW-managed delta state |
+| `LAST_SEQ` | Conceptual numeric delta high-water mark |
+| `LAST_CHANGED_AT` | Conceptual timestamp delta boundary |
+| `IS_DELETED` | Source-side delete/tombstone convention exposed through the DataSource |
+| `ZDB_CHANGE_LOG` | Source-side change-log table or view used as the extraction source |
+| `EVENT_SEQ` | Numeric generic-delta field on an ordered change stream |
+| `I / U / D` | Source-provided change semantics carried into BW processing |
+| `ZDB_EVENT_COUNT` | Source-side event sequencing infrastructure; not a BW runtime object |
+| `EZDBEVCOUNT` | Source-side concurrency control; not a BW DB Connect object |
+
+### External Table or View
+
+In a real DB Connect scenario, BW reads from an external relational database.
+
+The extraction source may be a physical table or, preferably in many integration designs, a database view that exposes a stable interface to BW.
+
+In the laboratory:
+
+```text
+ZDB_SRC_PRICE
+```
+
+plays this role.
+
+It represents a mutable current-state source with fields such as:
+
+```text
+PRODUCT_ID
+STORE_GROUP
+PRICE
+CURRENCY
+CREATED_SEQ
+CHANGED_AT
+IS_DELETED
+```
+
+The important point is not that this table physically resides in the ABAP Cloud system.
+
+Its role is to reproduce the semantics of an external database object whose rows can be inserted, updated, deleted, and committed concurrently with extraction.
+
+### Full Extraction
+
+`ZCL_DB_FULL_READER` corresponds conceptually to a DB Connect DataSource executed in full mode.
+
+The laboratory performs:
+
+```text
+SELECT all current source rows
+        |
+        v
+persist acquisition result
+```
+
+A real BW implementation would perform the extraction through the DB Connect source system and DataSource, with BW request management handling the acquisition process.
+
+The laboratory does not reproduce that runtime.
+
+It only preserves the extracted result in:
+
+```text
+ZDB_ACQ_PRICE
+```
+
+so that later delta experiments can be compared with the full baseline.
+
+### Generic Numeric Delta
+
+The experiment based on:
+
+```text
+CREATED_SEQ
+```
+
+corresponds conceptually to a generic numeric delta field.
+
+The consumer reads:
+
+```text
+CREATED_SEQ > LAST_SEQ
+```
+
+The experiment demonstrates an important source-design requirement:
+
+```text
+a monotonically increasing creation number
+is suitable for append-only data
+```
+
+but:
+
+```text
+it does not detect updates
+to previously created rows
+```
+
+In a real DB Connect design, selecting a numeric generic-delta field is therefore not merely a technical DataSource setting.
+
+The source field must have semantics that actually correspond to all business changes that BW needs to receive.
+
+### Generic Timestamp Delta
+
+The timestamp experiment corresponds conceptually to a DB Connect generic delta based on a timestamp field.
+
+The source maintains:
+
+```text
+CHANGED_AT
+```
+
+and the consumer initially uses:
+
+```text
+CHANGED_AT > LAST_CHANGED_AT
+```
+
+The laboratory demonstrates that this strategy can detect both:
+
+```text
+INSERT
+UPDATE
+```
+
+provided that every relevant source update also updates `CHANGED_AT`.
+
+This requirement belongs to the source interface contract.
+
+If a business row changes but `CHANGED_AT` does not, no BW configuration can recover that missing delta information.
+
+### Safety Intervals
+
+The upper and lower safety experiments correspond directly to the safety-window concept used with generic timestamp or date delta.
+
+The laboratory implements:
+
+```text
+LOWER_BOUND =
+LAST_CHANGED_AT - LOWER_SAFETY_INTERVAL
+
+UPPER_BOUND =
+REQUEST_START - UPPER_SAFETY_INTERVAL
+```
+
+and reads:
+
+```text
+LOWER_BOUND < CHANGED_AT <= UPPER_BOUND
+```
+
+The upper safety interval protects against changes that have already received a timestamp but are not yet committed and visible to the extractor.
+
+The lower safety interval intentionally re-reads part of the previously scanned range.
+
+This can generate duplicate after-images.
+
+The laboratory makes this behavior explicit by preserving repeated acquisition rows under different `RUN_ID` values.
+
+In a real BW system, the framework manages the generic-delta request boundaries and corresponding pointer state.
+
+The project reimplements this state only so that the behavior can be observed directly.
+
+### Delta State
+
+`ZDB_DELTA_STATE` is a laboratory object.
+
+It should not be interpreted as a table that must be created for standard SAP BW DB Connect.
+
+Its purpose is to make the normally framework-managed extraction state visible.
+
+For example:
+
+```text
+PRODUCT_PRICE
+LAST_SEQ
+LAST_CHANGED_AT
+```
+
+represents the laboratory state for the naive numeric and timestamp experiments.
+
+```text
+PRODUCT_PRICE_SAFE
+LAST_CHANGED_AT
+```
+
+represents the independent safe-timestamp experiment.
+
+In a real standard generic-delta scenario, BW manages the corresponding request and delta state.
+
+The project implements its own state only because there is no BW runtime in the ABAP Cloud Trial environment.
+
+### PSA / Acquisition Persistence
+
+`ZDB_ACQ_PRICE` is conceptually similar to an acquisition-history or PSA-like persistence layer.
+
+It stores:
+
+```text
+what a particular extraction run actually returned
+```
+
+rather than the final business state.
+
+For example, it can show separately:
+
+```text
+FULL
+NUMERIC
+TIMESTAMP
+TS_SAFE
+LOG_DELTA
+```
+
+runs.
+
+This is useful for the laboratory because it makes failure modes observable.
+
+It should not be interpreted as an implementation of the actual SAP BW PSA runtime.
+
+A real BW request provides additional functionality such as:
+
+```text
+request management
+technical status
+package handling
+monitoring
+restart processing
+integration with downstream DTP execution
+```
+
+which this laboratory intentionally does not reproduce.
+
+### Delete Semantics
+
+The physical-delete experiment demonstrates a source-side issue that also applies to real database extraction.
+
+If a row is physically removed from a current-state table:
+
+```text
+DELETE FROM source
+```
+
+a later timestamp-based `SELECT` has no row left to return.
+
+DB Connect cannot infer a deletion that is no longer represented in the extraction source.
+
+One solution is a source contract based on soft deletion:
+
+```text
+IS_DELETED = 'X'
+CHANGED_AT = new timestamp
+```
+
+The delete then becomes an ordinary extractable after-image.
+
+BW can carry this field into later processing and interpret it according to the target contract:
+
+```text
+delete
+deactivate
+close validity
+```
+
+The important point is that delete semantics must be represented by the source.
+
+They cannot be reconstructed automatically from an incremental timestamp query against a current-state table.
+
+### Transactional Change Log as a DB Connect Source
+
+The change-log branch represents an alternative source design.
+
+Instead of extracting directly from the mutable current-state table, BW could conceptually read from a source-side table or view containing:
+
+```text
+EVENT_SEQ
+BUSINESS KEY
+OPERATION
+AFTER-IMAGE
+```
+
+For example:
+
+```text
+1001  P1010/SOUTH  I  100.00
+1002  P1001/SOUTH  U   14.00
+1003  P1011/SOUTH  I  110.00
+1004  P1010/SOUTH  D
+```
+
+A DB Connect DataSource could then use:
+
+```text
+EVENT_SEQ
+```
+
+as a numeric delta field.
+
+This changes the meaning of the numeric pointer.
+
+In the earlier experiment:
+
+```text
+CREATED_SEQ
+```
+
+identified creation of a business row.
+
+In the change-log architecture:
+
+```text
+EVENT_SEQ
+```
+
+identifies every relevant business change.
+
+Therefore a simple selection such as:
+
+```text
+EVENT_SEQ > LAST_SEQ
+```
+
+can transport:
+
+```text
+INSERT
+UPDATE
+DELETE
+```
+
+through one ordered stream.
+
+### What SAP BW Would Manage
+
+In a real classical DB Connect implementation, BW would provide the surrounding acquisition infrastructure.
+
+Conceptually, BW would manage areas such as:
+
+```text
+DB connection configuration
+DataSource metadata
+full / delta request execution
+generic-delta state
+request monitoring
+PSA persistence
+downstream processing
+DTP execution
+Process Chain orchestration
+```
+
+The laboratory deliberately replaces these mechanisms with small ABAP classes and tables so that the delta semantics remain directly visible.
+
+For example:
+
+```text
+ZCL_DB_NUM_DELTA_READER
+```
+
+is not a replacement for a DB Connect DataSource.
+
+It is a controlled experiment that exposes what a numeric delta criterion actually sees.
+
+Similarly:
+
+```text
+ZCL_DB_TS_SAFE_READER
+```
+
+is not an implementation of the SAP generic-delta runtime.
+
+It is a transparent model of the boundary and overlap logic used to study the effect of safety intervals.
+
+### What Remains Source Responsibility
+
+Even when SAP BW provides the extraction framework, several guarantees must still come from the source design.
+
+For numeric delta:
+
+```text
+the numeric field must represent every relevant change
+```
+
+For timestamp delta:
+
+```text
+CHANGED_AT must be updated reliably
+for every relevant source modification
+```
+
+and:
+
+```text
+transaction / visibility lag must be bounded
+if finite safety intervals are expected
+to prevent gaps
+```
+
+For deletes:
+
+```text
+the source must expose deletion semantics
+```
+
+through a tombstone, soft-delete marker, or change log.
+
+For an event-log source:
+
+```text
+event creation must be transactionally coupled
+to the business change
+```
+
+and:
+
+```text
+EVENT_SEQ ordering must be safe for use
+as a high-water mark
+```
+
+These requirements are outside the ability of a BW DataSource to repair after the fact.
+
+### What This Lab Does Not Reproduce
+
+The project does not contain:
+
+```text
+DB Connect source-system configuration
+remote database drivers
+real external database connectivity
+BW DataSource metadata
+InfoPackages
+PSA runtime
+DTPs
+Transformations
+ADSOs
+Process Chains
+BW request monitor
+standard BW generic-delta administration
+```
+
+It also uses SAP HANA as the underlying database of the ABAP Cloud environment, so the observed database behavior must not be treated as a universal implementation model for every external RDBMS.
+
+The project instead focuses on the portable architectural questions:
+
+```text
+What defines a new change?
+
+When is that change visible?
+
+How can DELETE be represented?
+
+When may the consumer safely advance its pointer?
+
+What happens after a crash?
+
+What happens when producer transactions overlap?
+```
+
+These questions remain relevant regardless of whether the actual source database is Oracle, Microsoft SQL Server, SAP HANA, PostgreSQL, or another relational system.
+
+### Conceptual Summary
+
+The mapping can be summarized as:
+
+```text
+Laboratory                           Classical SAP BW DB Connect
+--------------------------------------------------------------------------
+
+ZDB_SRC_PRICE                       external table / view
+
+ZCL_DB_FULL_READER                  full extraction concept
+
+CREATED_SEQ                         numeric generic-delta field
+
+CHANGED_AT                          date / timestamp generic-delta field
+
+upper / lower safety logic          generic-delta safety intervals
+
+ZDB_DELTA_STATE                     visible laboratory model of
+                                    BW-managed delta state
+
+ZDB_ACQ_PRICE                       acquisition / PSA-like persistence
+                                    used only for the laboratory
+
+IS_DELETED                          source-provided deletion semantics
+
+ZDB_CHANGE_LOG                      alternative source-side change-log
+                                    table / view
+
+EVENT_SEQ                           numeric delta field over event stream
+
+ZCL_DB_LOG_DELTA_READER             conceptual ordered-log consumer
+
+ZDB_EVENT_COUNT / EZDBEVCOUNT       source-side implementation details,
+                                    not BW DB Connect objects
+```
+
+The main purpose of the mapping is not to reproduce SAP BW internals.
+
+It is to show which parts of reliable database acquisition are provided by the BW extraction framework and which guarantees must already exist in the source interface design.
 
 ## Project Limitations
 
+This project is a laboratory for studying database acquisition and delta reliability.
+
+It intentionally simplifies many aspects of a real enterprise integration landscape.
+
+The limitations are part of the project boundary and should be considered when interpreting the experiments.
+
+### No Real SAP BW Runtime
+
+The project runs in:
+
+```text
+SAP BTP ABAP Environment / ABAP Cloud
+```
+
+and not in a real SAP BW or BW/4HANA system.
+
+It therefore does not use:
+
+```text
+DB Connect source systems
+BW DataSources
+InfoPackages
+PSA runtime
+Transformations
+DTPs
+ADSOs
+Process Chains
+BW request management
+standard BW delta administration
+```
+
+The project models only the acquisition semantics that are relevant for understanding:
+
+```text
+full extraction
+numeric delta
+timestamp delta
+safety intervals
+delete handling
+ordered change logs
+restart behavior
+transactional consistency
+```
+
+The laboratory classes must not be interpreted as replacements for standard BW runtime components.
+
+---
+
+### No Real External Database
+
+`ZDB_SRC_PRICE` is a local ABAP Cloud database table.
+
+It simulates an external relational source.
+
+There is no actual connection to:
+
+```text
+Oracle
+Microsoft SQL Server
+PostgreSQL
+SAP HANA remote source
+or another external RDBMS
+```
+
+This provides a controlled environment for reproducible experiments, but it also means that:
+
+```text
+network failures
+remote database drivers
+connection pooling
+remote transaction boundaries
+vendor-specific isolation behavior
+remote SQL dialect differences
+```
+
+are outside the project scope.
+
+---
+
+### Database Behavior Is Observed in One Platform
+
+The laboratory runs on the database infrastructure underlying SAP BTP ABAP Environment.
+
+The experiments should therefore be interpreted primarily as demonstrations of acquisition architecture, not as universal proofs of exact database behavior across all relational database systems.
+
+Different source databases may differ in:
+
+```text
+transaction isolation
+locking behavior
+timestamp precision
+commit visibility
+snapshot semantics
+sequence implementation
+concurrency behavior
+```
+
+The architectural conclusions remain useful, but production behavior must be validated against the actual source RDBMS.
+
+---
+
+### Simplified Source Data Model
+
+The business model is intentionally small.
+
+The source contains only a simple price structure:
+
+```text
+PRODUCT_ID
+STORE_GROUP
+PRICE
+CURRENCY
+CREATED_SEQ
+CHANGED_AT
+IS_DELETED
+```
+
+This is sufficient for the experiments but does not represent complexities such as:
+
+```text
+multiple related tables
+referential integrity across objects
+multi-row business transactions
+header/item structures
+large payloads
+hierarchies
+time-dependent master data
+high-volume fact tables
+```
+
+A production extraction design may need to preserve consistency across several related tables or business objects.
+
+---
+
+### Simplified Acquisition Persistence
+
+`ZDB_ACQ_PRICE` preserves acquisition history for laboratory analysis.
+
+It is deliberately lightweight.
+
+It does not provide the complete behavior of a BW PSA or request framework, including:
+
+```text
+request lifecycle management
+package processing
+technical request status
+error stacks
+restart metadata
+parallel package execution
+monitor integration
+downstream request dependencies
+```
+
+Its main purpose is to make visible:
+
+```text
+what each extraction run actually acquired
+```
+
+---
+
+### Simplified Delta-State Management
+
+`ZDB_DELTA_STATE` is a laboratory representation of persistent consumer state.
+
+It makes the delta pointer explicit so that the experiments can show exactly when it changes.
+
+In a real BW generic-delta scenario, the relevant state is maintained by the BW framework.
+
+The project does not reproduce the complete internal logic of SAP BW delta administration.
+
+---
+
+### Timestamp Safety Values Are Demonstration Values
+
+The safe timestamp reader uses:
+
+```text
+UPPER_SAFETY_INTERVAL = 300 seconds
+LOWER_SAFETY_INTERVAL = 300 seconds
+```
+
+These values were chosen to make the experiments easy to reproduce.
+
+They are not production recommendations.
+
+A real system would need safety values derived from measurable source-system behavior such as:
+
+```text
+maximum transaction duration
+commit visibility lag
+batch-processing characteristics
+clock behavior
+operational SLA
+```
+
+The correct values depend on the actual source environment.
+
+---
+
+### Timestamp Delta Still Depends on Source Discipline
+
+The timestamp architecture assumes that every relevant source change reliably updates:
+
+```text
+CHANGED_AT
+```
+
+If a business field changes without changing `CHANGED_AT`, the delta reader cannot detect it.
+
+The project does not attempt to enforce this rule automatically.
+
+It is treated as part of the source interface contract.
+
+Similarly, safe timestamp extraction assumes that commit / visibility lag is bounded.
+
+If a transaction can remain uncommitted for arbitrarily long periods after `CHANGED_AT` is assigned, no finite safety interval provides a strict lossless guarantee.
+
+---
+
+### Soft Delete Requires a Source-Side Contract
+
+Timestamp-based delete handling uses:
+
+```text
+IS_DELETED = 'X'
+```
+
+while retaining the source row.
+
+This requires the source application to support tombstone semantics.
+
+The laboratory does not implement:
+
+```text
+tombstone retention policy
+physical purge scheduling
+archive management
+downstream delete confirmation
+```
+
+A production design must define when a tombstone can safely be removed.
+
+---
+
+### The Change Log Is a Laboratory Implementation
+
+`ZDB_CHANGE_LOG` demonstrates an ordered transactional event stream.
+
+The project does not claim to implement a production CDC platform.
+
+It does not use technologies such as:
+
+```text
+database redo-log CDC
+LSN-based replication
+SAP SLT
+SAP SDI
+Kafka
+outbox infrastructure
+database-native change streams
+```
+
+Instead, the source application explicitly writes change events in the same LUW as the business change.
+
+This makes the transactional principle easy to observe.
+
+---
+
+### Single Counter Serialization
+
+The transactional producer uses one protected event counter for:
+
+```text
+PRODUCT_PRICE_LOG
+```
+
+This guarantees commit-consistent ordering in the laboratory.
+
+The trade-off is serialization.
+
+At high producer volumes, a single counter lock could become a bottleneck.
+
+Production architectures may instead use more scalable mechanisms such as:
+
+```text
+database log sequence numbers
+partitioned event streams
+transactional outbox patterns
+database-native CDC
+distributed messaging infrastructure
+```
+
+The project intentionally prioritizes clarity of correctness over throughput.
+
+---
+
+### All Producers Must Follow the Protocol
+
+The reliability of the change-log architecture depends on every producer using the same protocol:
+
+```text
+lock
+allocate EVENT_SEQ
+update counter
+apply business change
+write log event
+COMMIT
+unlock
+```
+
+If another writer modifies the same business table but does not produce a corresponding log event, the change can be invisible to the change-log consumer.
+
+If another producer allocates sequences without the same ordering protocol, the `EVENT_SEQ` high-water-mark guarantee can be broken.
+
+The project does not technically prevent external code from bypassing this contract.
+
+---
+
+### Single Active Change-Log Consumer Assumption
+
+`ZCL_DB_LOG_DELTA_READER` assumes one active consumer instance for:
+
+```text
+PRODUCT_PRICE_LOG
+```
+
+The consumer pointer itself is not protected by a dedicated concurrency lock.
+
+Two consumers running concurrently against the same logical source could therefore require additional coordination.
+
+This scenario is intentionally outside the current project scope.
+
+---
+
+### No Consumer Group Model
+
+The project maintains one consumer pointer per logical source.
+
+It does not implement multiple independent subscribers such as:
+
+```text
+Consumer A LAST_SEQ = 1007
+Consumer B LAST_SEQ = 1003
+Consumer C LAST_SEQ = 1009
+```
+
+A production event-stream design may need one pointer per consumer or consumer group.
+
+That would also affect change-log retention because events cannot be removed until all required consumers have passed them.
+
+---
+
+### No Change-Log Retention Management
+
+`ZDB_CHANGE_LOG` acts as a durable replay source during the experiments.
+
+The project does not implement:
+
+```text
+event retention windows
+archiving
+log partitioning
+purge rules
+consumer-aware cleanup
+```
+
+In production, change-log growth must be managed carefully.
+
+Deleting events too early could make consumer restart or replay impossible.
+
+---
+
+### No Performance or Volume Benchmark
+
+The laboratory uses only a very small number of rows.
+
+It does not measure:
+
+```text
+throughput
+latency under load
+lock contention
+database growth
+large delta package behavior
+memory consumption
+parallel extraction performance
+```
+
+The project therefore demonstrates correctness properties, not scalability characteristics.
+
+---
+
+### No Production Error-Handling Framework
+
+The classes contain explicit checks, rollback paths, and diagnostic output, but there is no general application framework for:
+
+```text
+central logging
+alerting
+monitoring
+retry scheduling
+dead-letter processing
+operations dashboards
+support workflows
+```
+
+Failure handling is implemented only to the extent required to demonstrate the relevant acquisition behavior.
+
+---
+
+### Debug Anchors Are Intentional
+
+Some classes contain manual debugging anchors before `COMMIT`.
+
+These are intentionally retained.
+
+They allow two-session experiments such as:
+
+```text
+delayed COMMIT
+producer lock contention
+consumer interruption
+```
+
+to be reproduced in ADT.
+
+They are laboratory instrumentation and would not belong in normal production processing.
+
+---
+
+### No Generic Extraction Framework
+
+The project intentionally contains separate classes for individual scenarios.
+
+It does not attempt to provide a reusable abstraction such as:
+
+```text
+generic source adapter
+generic delta strategy interface
+generic persistence framework
+configuration-driven acquisition engine
+```
+
+This is deliberate.
+
+The main goal is to keep transaction boundaries, pointer updates, and failure conditions directly visible in the code.
+
+---
+
+### Not a Production Template
+
+The repository should therefore be read as:
+
+```text
+an executable architectural laboratory
+```
+
+rather than:
+
+```text
+a production-ready integration framework
+```
+
+Its purpose is to demonstrate why different acquisition strategies succeed or fail under specific conditions and to make their reliability contracts explicit.
+
+The production design for a real SAP BW / BW/4HANA system must additionally consider:
+
+```text
+actual source database behavior
+SAP-supported connectivity
+data volume
+security
+authorization
+monitoring
+operational ownership
+retention
+performance
+recovery SLA
+source-system constraints
+```
+
+The project deliberately stops before those implementation-specific concerns.
+
+
 ## Key Takeaways
+
+This laboratory is built around one central acquisition question:
+
+```text
+Under what conditions can the consumer
+advance its delta pointer
+without losing a committed source change?
+```
+
+The experiments show that the answer depends on the semantics of the source data and on the reliability contract behind the chosen delta field.
+
+### 1. A Delta Field Is Only as Good as Its Semantics
+
+A field may be technically monotonic or time-dependent and still be unsuitable for reliable delta acquisition.
+
+For example:
+
+```text
+CREATED_SEQ
+```
+
+works for newly created rows but does not detect later updates to existing rows.
+
+Therefore:
+
+```text
+creation order
+!=
+change order
+```
+
+A numeric delta field is reliable only if its value changes for every business event that must be extracted.
+
+---
+
+### 2. Timestamp Delta Detects Updates, but Visibility Matters
+
+A correctly maintained:
+
+```text
+CHANGED_AT
+```
+
+can detect both inserts and updates in a mutable current-state table.
+
+However:
+
+```text
+time when CHANGED_AT is assigned
+```
+
+is not necessarily the same as:
+
+```text
+time when the transaction becomes committed
+and visible to another session
+```
+
+A later committed row can therefore move the consumer pointer past an older still-uncommitted change.
+
+This is the fundamental delayed-COMMIT failure demonstrated by the project.
+
+---
+
+### 3. `>=` Does Not Solve the Delayed-COMMIT Problem
+
+Changing:
+
+```text
+CHANGED_AT > LAST_CHANGED_AT
+```
+
+to:
+
+```text
+CHANGED_AT >= LAST_CHANGED_AT
+```
+
+does not solve the general problem.
+
+If the delayed change has:
+
+```text
+T1
+```
+
+and a later visible change advances the pointer to:
+
+```text
+T2
+```
+
+where:
+
+```text
+T1 < T2
+```
+
+then the delayed row is still behind the pointer after it commits.
+
+The issue is therefore not equality at the extraction boundary.
+
+It is the difference between:
+
+```text
+change time
+```
+
+and:
+
+```text
+visibility time
+```
+
+---
+
+### 4. Upper Safety Protects the Recent Time Region
+
+An upper safety interval deliberately prevents the consumer from reading too close to the current time.
+
+Instead of scanning up to:
+
+```text
+REQUEST_START
+```
+
+the reader scans only up to:
+
+```text
+REQUEST_START - UPPER_SAFETY_INTERVAL
+```
+
+This allows recent transactions additional time to commit before the consumer declares that time region fully scanned.
+
+The cost is extraction latency.
+
+A larger upper safety interval provides more protection but delays delivery of recent changes.
+
+---
+
+### 5. Lower Safety Creates Controlled Overlap
+
+A lower safety interval moves the lower extraction boundary backward:
+
+```text
+LAST_CHANGED_AT - LOWER_SAFETY_INTERVAL
+```
+
+This intentionally re-reads part of the previously scanned time range.
+
+The result is:
+
+```text
+possible duplicate after-images
+```
+
+rather than:
+
+```text
+a strict one-time delivery guarantee
+```
+
+This is usually acceptable only when downstream processing is compatible with repeated after-images, for example overwrite-style semantics.
+
+It can be unsafe for additive or non-idempotent processing.
+
+---
+
+### 6. Timestamp Delta Depends on a Bounded Visibility Contract
+
+Safety intervals can protect timestamp delta only if the delay between:
+
+```text
+assigning CHANGED_AT
+```
+
+and:
+
+```text
+transaction commit / visibility
+```
+
+has a practical upper bound.
+
+If source transactions can remain uncommitted for arbitrarily long periods, then:
+
+```text
+no finite upper safety interval
+can guarantee lossless extraction
+```
+
+A lower overlap window does not remove this fundamental dependency.
+
+Timestamp delta is therefore correct only under an explicit timing contract.
+
+---
+
+### 7. Physical DELETE Is Invisible in a Current-State Timestamp Source
+
+A physical delete removes the row that the extractor would need to select.
+
+After:
+
+```text
+DELETE FROM source
+```
+
+there is no remaining:
+
+```text
+CHANGED_AT
+```
+
+to evaluate.
+
+Therefore a current-state timestamp extractor cannot discover that deletion automatically.
+
+The source must expose deletion semantics explicitly.
+
+---
+
+### 8. Soft DELETE Makes Deletion Extractable
+
+A soft-delete model keeps the row and changes:
+
+```text
+IS_DELETED = 'X'
+CHANGED_AT = new timestamp
+```
+
+The deletion then becomes an ordinary timestamped after-image.
+
+This works naturally with current-state timestamp extraction.
+
+The trade-off is the need to retain tombstone rows until they can be safely archived or purged.
+
+---
+
+### 9. A Transactional Change Log Uses a Different Correctness Model
+
+The change-log architecture does not try to infer all business changes from the current-state table.
+
+Instead, the source publishes explicit events:
+
+```text
+I
+U
+D
+```
+
+with a monotonically increasing:
+
+```text
+EVENT_SEQ
+```
+
+The consumer then reads:
+
+```text
+EVENT_SEQ > LAST_SEQ
+ORDER BY EVENT_SEQ
+```
+
+The reliability contract is no longer primarily temporal.
+
+It becomes:
+
+```text
+business change
++
+event creation
++
+sequence allocation
+```
+
+must be transactionally consistent and ordered correctly.
+
+---
+
+### 10. Monotonic Sequence Alone Is Not Enough
+
+A source can still lose events even with a perfectly increasing event number if producers can commit out of sequence.
+
+The dangerous state is:
+
+```text
+1003 committed and visible
+1002 still uncommitted
+```
+
+A consumer could read `1003`, advance its pointer, and later skip `1002`.
+
+Therefore:
+
+```text
+monotonic sequence
+```
+
+must be combined with:
+
+```text
+commit-consistent ordering
+```
+
+In the laboratory this is achieved by serializing producer access to the event counter with:
+
+```text
+EZDBEVCOUNT
+```
+
+---
+
+### 11. Producer Locking and Transaction Atomicity Solve Different Problems
+
+The producer lock guarantees:
+
+```text
+event ordering across concurrent producers
+```
+
+The database transaction guarantees:
+
+```text
+atomic consistency of
+event counter
+business state
+change-log event
+```
+
+Both are required.
+
+The lock does not replace `COMMIT` / `ROLLBACK`.
+
+The transaction does not by itself guarantee safe sequence ordering between concurrent producers.
+
+---
+
+### 12. The Change Log Handles Physical Deletes Naturally
+
+Because deletion is represented explicitly as:
+
+```text
+OPERATION = D
+```
+
+the business row may be physically removed from the current-state table.
+
+The delete remains durable in:
+
+```text
+ZDB_CHANGE_LOG
+```
+
+This removes the requirement for permanent tombstones in the current-state source.
+
+---
+
+### 13. Change-Log Correctness Does Not Depend on Transaction Duration
+
+With commit-consistent sequence allocation:
+
+```text
+a long-running transaction remains invisible
+and prevents later sequence publication
+```
+
+until it commits or rolls back.
+
+The consumer therefore cannot move past that uncommitted event.
+
+This means that change-log delta correctness is not based on estimating how long source transactions may remain open.
+
+This is one of the strongest architectural differences from timestamp delta.
+
+---
+
+### 14. Consumer Pointer Advancement Must Be Atomic with Persistence
+
+A consumer must never do:
+
+```text
+advance pointer
+COMMIT
+
+then
+
+persist acquired data
+```
+
+because a crash between these steps would permanently lose data.
+
+The safe pattern is:
+
+```text
+persist acquired data
+        |
+        v
+advance consumer pointer
+        |
+        v
+COMMIT both together
+```
+
+If the transaction fails before commit:
+
+```text
+acquisition rows disappear
+pointer remains unchanged
+source events remain available
+```
+
+and the same events can be replayed.
+
+---
+
+### 15. Producer Rollback Must Restore the Entire Source-Side State
+
+For the change-log producer:
+
+```text
+counter update
++
+business change
++
+log event
+```
+
+must be one LUW.
+
+If the log insert fails, rollback must restore:
+
+```text
+event counter
+business state
+```
+
+and prevent a partial event from being published.
+
+Only then can the same event sequence be safely reused on retry.
+
+---
+
+### 16. Producer State and Consumer State Are Independent
+
+The producer pointer:
+
+```text
+ZDB_EVENT_COUNT-LAST_EVENT_SEQ
+```
+
+means:
+
+```text
+highest event committed by the producer
+```
+
+The consumer pointer:
+
+```text
+ZDB_DELTA_STATE-LAST_SEQ
+```
+
+means:
+
+```text
+highest event successfully persisted
+by the consumer
+```
+
+These values do not need to be equal.
+
+Their difference represents the current acquisition backlog.
+
+---
+
+### 17. Full, Numeric, Timestamp, and Log Delta Answer Different Questions
+
+The experiments show that these strategies should not be treated as interchangeable technical options.
+
+They rely on different source semantics:
+
+```text
+FULL
+-> what exists now?
+
+CREATED_SEQ delta
+-> what rows were created after the pointer?
+
+CHANGED_AT delta
+-> what current rows changed inside a time range?
+
+Transactional log delta
+-> what business events occurred after the event pointer?
+```
+
+Choosing a delta method therefore starts with understanding the source model, not with choosing a configuration checkbox.
+
+---
+
+### 18. Reliability Comes from an Explicit Contract
+
+The most important conclusion of the project is that reliable acquisition is not created by the consumer alone.
+
+The source and consumer must share a contract.
+
+For timestamp delta:
+
+```text
+every relevant change updates CHANGED_AT
++
+delete semantics are exposed
++
+visibility delay is bounded
++
+safety intervals match that bound
+```
+
+For transactional change log:
+
+```text
+every relevant business change creates an event
++
+business change and event are one LUW
++
+EVENT_SEQ is commit-order-consistent
++
+the consumer advances only after successful persistence
+```
+
+If any part of the contract is violated, a technically correct `SELECT` statement can still produce an incorrect delta.
+
+---
+
+### 19. SAP BW Can Manage Delta State, but It Cannot Repair Missing Source Semantics
+
+A real SAP BW DB Connect implementation provides the surrounding extraction framework:
+
+```text
+DataSource
+request management
+generic delta state
+PSA
+monitoring
+downstream processing
+```
+
+But BW still depends on the source to provide meaningful and reliable delta information.
+
+BW cannot automatically reconstruct:
+
+```text
+an update that did not change the delta field
+a physical delete that left no trace
+an event that was never logged
+a timestamp contract that is violated by unbounded delayed commits
+```
+
+Therefore source-interface design remains part of BW acquisition architecture.
+
+---
+
+### 20. The Main Design Question Is About Safe Pointer Advancement
+
+Across all experiments, the same principle appears repeatedly:
+
+```text
+A delta pointer may advance only when
+all source changes before that boundary
+are guaranteed to be either:
+
+1. already acquired,
+or
+2. still recoverable by a future request.
+```
+
+For timestamp delta, this guarantee comes from carefully defined time boundaries and overlap.
+
+For transactional change log, it comes from durable ordered events and transactional sequencing.
+
+That is the central architectural lesson of the project.
