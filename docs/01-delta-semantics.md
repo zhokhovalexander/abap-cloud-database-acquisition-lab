@@ -5443,8 +5443,6 @@ The next section examines exactly that requirement:
 Producer Concurrency and Commit-Consistent Ordering
 ```
 
-
-
 ## Producer Concurrency and Commit-Consistent Ordering
 
 A monotonically increasing `EVENT_SEQ` is not enough by itself to guarantee a correct change-log delta.
