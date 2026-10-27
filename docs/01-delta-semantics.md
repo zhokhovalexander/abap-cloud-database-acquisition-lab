@@ -3486,3 +3486,791 @@ What happens when the source row disappears completely?
 ```
 
 That question leads to physical and soft delete semantics.
+
+
+## Physical and Soft Delete Semantics
+
+Timestamp delta can detect inserts and updates as long as the current-state row remains present and its:
+
+```text
+CHANGED_AT
+```
+
+is updated correctly.
+
+Deletion introduces a different problem.
+
+If the source physically removes a row, the row no longer exists when the consumer performs its next query.
+
+The consumer therefore has nothing left to select.
+
+This means that a timestamp field alone cannot make a physical delete visible.
+
+---
+
+### Physical DELETE
+
+Assume the source contains:
+
+```text
+P1003/SOUTH
+PRICE      = 30.00
+CHANGED_AT = T1
+```
+
+The source application performs:
+
+```text
+DELETE P1003/SOUTH
+```
+
+After commit, the current-state table contains no row for:
+
+```text
+P1003/SOUTH
+```
+
+The timestamp consumer executes:
+
+```text
+LOWER_BOUND < CHANGED_AT <= UPPER_BOUND
+```
+
+but there is no remaining source row whose:
+
+```text
+CHANGED_AT
+```
+
+can satisfy the condition.
+
+The physical delete is therefore invisible.
+
+---
+
+### Why Updating CHANGED_AT Is Impossible After DELETE
+
+For inserts and updates, the source can maintain:
+
+```text
+CHANGED_AT
+```
+
+on the row itself.
+
+For a physical delete:
+
+```text
+row removed
+```
+
+means that all row attributes disappear together:
+
+```text
+PRODUCT_ID
+STORE_GROUP
+PRICE
+CURRENCY
+CHANGED_AT
+IS_DELETED
+```
+
+The consumer cannot later query a timestamp from an object that no longer exists.
+
+The problem is therefore not:
+
+```text
+insufficient timestamp precision
+```
+
+or:
+
+```text
+incorrect safety intervals
+```
+
+It is a source-model problem.
+
+The current-state table no longer contains evidence that the deleted business key ever existed.
+
+---
+
+### Full Extraction and Physical DELETE
+
+A full extraction can indirectly reveal a missing row by comparing two complete snapshots.
+
+For example:
+
+```text
+Previous snapshot:
+
+P1001
+P1002
+P1003
+```
+
+Later snapshot:
+
+```text
+P1001
+P1002
+```
+
+A downstream reconciliation process could infer:
+
+```text
+P1003 disappeared
+```
+
+However, this is not ordinary timestamp delta.
+
+It requires:
+
+```text
+complete snapshot comparison
+```
+
+and retained knowledge of the previous state.
+
+The laboratory delta consumer intentionally does not use that strategy.
+
+---
+
+### Timestamp Delta Needs Explicit Delete Semantics
+
+For a current-state timestamp source, deletion must remain represented in some extractable form.
+
+One common approach is:
+
+```text
+soft delete
+```
+
+Instead of physically removing the row, the source changes a deletion marker such as:
+
+```text
+IS_DELETED = 'X'
+```
+
+and updates:
+
+```text
+CHANGED_AT
+```
+
+The row remains queryable and can therefore participate in the normal timestamp-delta mechanism.
+
+---
+
+### Soft DELETE
+
+The laboratory restores the previously deleted business key and then performs:
+
+```text
+P1003/SOUTH
+IS_DELETED = 'X'
+CHANGED_AT = T2
+```
+
+The row remains in:
+
+```text
+ZDB_SRC_PRICE
+```
+
+but its business meaning changes.
+
+The source state becomes conceptually:
+
+```text
+P1003/SOUTH
+PRICE       = 30.00
+IS_DELETED  = X
+CHANGED_AT  = T2
+```
+
+The timestamp reader can now evaluate:
+
+```text
+LOWER_BOUND < T2 <= UPPER_BOUND
+```
+
+and acquire the row normally.
+
+---
+
+### Two Independent Pieces of Information
+
+A soft-delete record carries two different kinds of information.
+
+`CHANGED_AT` answers:
+
+```text
+When did this row become relevant
+for delta extraction?
+```
+
+`IS_DELETED` answers:
+
+```text
+What does this changed row mean?
+```
+
+The two fields therefore serve different purposes.
+
+Conceptually:
+
+```text
+CHANGED_AT
+-> delta eligibility
+
+IS_DELETED
+-> delete semantics
+```
+
+The consumer needs both.
+
+A changed timestamp without a delete marker would look like an ordinary update.
+
+A delete marker without a new timestamp might never become eligible for delta extraction.
+
+---
+
+### Resulting Delta Behavior
+
+With a soft delete:
+
+```text
+before:
+
+P1003/SOUTH
+IS_DELETED = ''
+CHANGED_AT = T1
+```
+
+after:
+
+```text
+P1003/SOUTH
+IS_DELETED = 'X'
+CHANGED_AT = T2
+```
+
+The timestamp consumer receives:
+
+```text
+P1003/SOUTH
+IS_DELETED = X
+```
+
+as a normal after-image.
+
+The downstream layer can then interpret the marker according to its own target semantics.
+
+For example:
+
+```text
+delete target record
+```
+
+or:
+
+```text
+mark target object inactive
+```
+
+or:
+
+```text
+close validity interval
+```
+
+The acquisition layer only needs to preserve the delete meaning.
+
+---
+
+### Physical and Soft DELETE Compared
+
+The difference is:
+
+```text
+Physical DELETE
+
+source row disappears
+        |
+        v
+no CHANGED_AT remains
+        |
+        v
+timestamp delta sees nothing
+```
+
+versus:
+
+```text
+Soft DELETE
+
+source row remains
+        |
+        v
+IS_DELETED = X
+CHANGED_AT updated
+        |
+        v
+timestamp delta selects the row
+```
+
+This is why soft deletion fits naturally with a current-state timestamp source.
+
+---
+
+### Tombstone Semantics
+
+A soft-deleted row can be treated as a tombstone.
+
+A tombstone means:
+
+```text
+this business key no longer represents
+an active source object,
+but the deletion information must remain
+available to downstream consumers
+```
+
+The source therefore retains a technical representation of the deleted object even though the business object is no longer active.
+
+This retention is necessary because consumers may not read the source immediately.
+
+---
+
+### Tombstone Retention
+
+A soft-delete architecture introduces a new lifecycle question:
+
+```text
+How long must the tombstone remain?
+```
+
+The answer depends on the acquisition contract.
+
+If the source removes the tombstone too early:
+
+```text
+soft delete
+        |
+        v
+consumer has not yet acquired it
+        |
+        v
+physical purge
+```
+
+then the delete can become invisible again.
+
+Therefore a tombstone must remain until the source can guarantee that every required consumer has had sufficient opportunity to receive it.
+
+The laboratory does not implement a tombstone-retention mechanism.
+
+It only demonstrates the acquisition semantics.
+
+---
+
+### Safety Intervals Still Apply
+
+A soft delete is still a timestamp-based change.
+
+Therefore it is subject to the same visibility rules as any other update.
+
+For example:
+
+```text
+IS_DELETED = X
+CHANGED_AT = T1
+```
+
+may be assigned inside a transaction that does not commit immediately.
+
+The timestamp consumer must still rely on:
+
+```text
+upper safety
+lower overlap
+bounded visibility lag
+```
+
+to avoid moving its pointer past a late-visible tombstone.
+
+Soft deletion solves:
+
+```text
+representation of DELETE
+```
+
+but does not solve:
+
+```text
+transaction visibility
+```
+
+These are separate concerns.
+
+---
+
+### Repeated Tombstones
+
+Lower safety overlap may cause the same soft-delete row to be delivered more than once.
+
+For example:
+
+```text
+Run A:
+P1003/SOUTH  IS_DELETED = X
+```
+
+and later:
+
+```text
+Run B:
+P1003/SOUTH  IS_DELETED = X
+```
+
+This should be treated as repeated delivery of the same delete after-image.
+
+A downstream target should therefore ideally support idempotent delete handling.
+
+Conceptually:
+
+```text
+delete P1003
+delete P1003 again
+```
+
+should not produce an incorrect state.
+
+This is another reason why downstream semantics matter when timestamp overlap is used.
+
+---
+
+### Soft DELETE Preserves Current-State Modeling
+
+Even with tombstones, the source remains fundamentally a current-state model.
+
+For each business key, the table stores one current representation:
+
+```text
+active current row
+```
+
+or:
+
+```text
+deleted current row / tombstone
+```
+
+It does not preserve the complete history:
+
+```text
+INSERT
+UPDATE
+UPDATE
+DELETE
+```
+
+as separate events.
+
+Only the latest row state remains.
+
+This distinction becomes important when comparing timestamp delta with a transactional change log.
+
+---
+
+### Loss of Intermediate Changes
+
+Suppose the same business key changes several times between extraction requests:
+
+```text
+10.00
+-> 12.00
+-> 15.00
+```
+
+and the consumer finally reads:
+
+```text
+PRICE = 15.00
+```
+
+A current-state timestamp source may deliver only the latest after-image.
+
+The intermediate value:
+
+```text
+12.00
+```
+
+may no longer exist.
+
+Similarly, a row could conceptually undergo:
+
+```text
+UPDATE
+UPDATE
+SOFT DELETE
+```
+
+before the next extraction.
+
+The consumer may see only:
+
+```text
+IS_DELETED = X
+```
+
+This can be completely correct when the integration requirement is:
+
+```text
+synchronize current state
+```
+
+but it is not sufficient when the requirement is:
+
+```text
+preserve every business event
+```
+
+---
+
+### Current-State Synchronization vs Event History
+
+Soft-delete timestamp delta is appropriate when the consumer primarily needs to know:
+
+```text
+What should the current target state be?
+```
+
+It is less suitable when the consumer needs to know:
+
+```text
+Exactly what sequence of operations occurred?
+```
+
+For example:
+
+```text
+current-state requirement:
+
+P1003 is deleted
+```
+
+may be enough.
+
+But an audit or transactional process may require:
+
+```text
+P1003 inserted
+P1003 updated
+P1003 updated again
+P1003 deleted
+```
+
+A current-state table does not necessarily retain that history.
+
+---
+
+### Alternative: Separate Delete Log
+
+Another possible source design is to maintain physical current-state data together with a separate deletion log.
+
+Conceptually:
+
+```text
+CURRENT_TABLE
++
+DELETE_LOG
+```
+
+The current table may physically remove rows, while the delete log preserves keys and deletion timestamps.
+
+This can make physical deletion visible to a delta consumer.
+
+However, once separate change records are introduced, the architecture begins to move toward an explicit change-log model.
+
+The laboratory explores that stronger model directly with:
+
+```text
+ZDB_CHANGE_LOG
+```
+
+---
+
+### Transactional Change Log
+
+In the change-log architecture, physical deletion is no longer a problem because the delete itself becomes an event.
+
+For example:
+
+```text
+EVENT_SEQ = 1004
+PRODUCT_ID = P1010
+STORE_GROUP = SOUTH
+OPERATION = D
+```
+
+The current-state row may then be physically removed:
+
+```text
+DELETE P1010/SOUTH
+```
+
+while the deletion information remains durable in the event stream.
+
+This separates:
+
+```text
+current business state
+```
+
+from:
+
+```text
+change history
+```
+
+---
+
+### Timestamp Soft DELETE vs Change-Log DELETE
+
+The two approaches can be compared as:
+
+```text
+Timestamp + soft delete
+
+current-state row remains
+IS_DELETED = X
+CHANGED_AT updated
+
+consumer detects deletion
+through current-state after-image
+```
+
+versus:
+
+```text
+Transactional change log
+
+current-state row may disappear
+D event remains in log
+
+consumer detects deletion
+through explicit event
+```
+
+The first architecture modifies the current-state model to preserve delete information.
+
+The second preserves delete information outside the current-state table.
+
+---
+
+### Source Contract for Soft DELETE
+
+For soft-delete timestamp delta to be reliable, the source must guarantee:
+
+```text
+1. Physical deletion is not performed
+   before the tombstone is safely retained.
+
+2. Every logical deletion sets IS_DELETED.
+
+3. Every logical deletion updates CHANGED_AT.
+
+4. The tombstone remains available long enough
+   for required consumers to acquire it.
+
+5. Timestamp visibility still satisfies
+   the configured safety-window contract.
+```
+
+If any of these conditions fails, deletion information can be lost.
+
+---
+
+### Source Contract for Physical DELETE
+
+A pure current-state timestamp source cannot reliably communicate physical deletion after the row has disappeared.
+
+Therefore a system that requires physical deletion must provide some additional durable representation, such as:
+
+```text
+delete log
+change-log table
+CDC stream
+transactional outbox
+database redo-log based CDC
+```
+
+The exact technology is not important for the laboratory conclusion.
+
+The important requirement is:
+
+```text
+DELETE must leave an extractable trace.
+```
+
+---
+
+### Result of the Experiment
+
+The physical-delete experiment produces:
+
+```text
+DELETE P1003/SOUTH
+
+source row disappears
+
+timestamp reader:
+0 deletion rows
+```
+
+The consumer cannot detect the change.
+
+The soft-delete experiment produces:
+
+```text
+P1003/SOUTH
+IS_DELETED = X
+CHANGED_AT = T2
+```
+
+and after the timestamp enters the safe extraction window:
+
+```text
+timestamp reader:
+P1003/SOUTH acquired
+IS_DELETED = X
+```
+
+The central conclusion is:
+
+```text
+A current-state timestamp delta can detect deletion
+only if deletion remains represented
+in the extractable source state.
+```
+
+For this architecture:
+
+```text
+physical DELETE
+-> invisible
+
+soft DELETE / tombstone
+-> visible
+```
+
+This solves deletion for current-state synchronization, but it still does not provide a durable ordered history of all source operations.
+
+That requirement leads to the next source model:
+
+```text
+Transactional Change Log
+```
