@@ -2697,3 +2697,792 @@ the maximum timestamp returned by the previous request
 The next step is to extend this model with a lower safety interval, which intentionally rereads part of the already scanned time range and introduces controlled overlap
 
 
+## Lower Safety Interval and Controlled Overlap
+
+The upper safety interval protects the newest time region by delaying extraction until source changes are old enough to be considered stable.
+
+The lower safety interval addresses a different problem.
+
+Instead of moving the upper boundary backward, it moves the lower extraction boundary backward.
+
+This intentionally re-reads part of the time range that the consumer has already processed.
+
+The purpose is controlled overlap.
+
+---
+
+### Basic Idea
+
+Assume the persistent timestamp pointer is:
+
+```text
+LAST_CHANGED_AT = T0
+```
+
+Without lower overlap, the next request would start from:
+
+```text
+CHANGED_AT > T0
+```
+
+With a lower safety interval, the reader calculates:
+
+```text
+LOWER_BOUND =
+LAST_CHANGED_AT - LOWER_SAFETY_INTERVAL
+```
+
+and uses:
+
+```text
+LOWER_BOUND < CHANGED_AT <= UPPER_BOUND
+```
+
+The interval:
+
+```text
+LOWER_BOUND < CHANGED_AT <= LAST_CHANGED_AT
+```
+
+has already been scanned by the previous request.
+
+It is deliberately read again.
+
+---
+
+### Complete Safe Timestamp Window
+
+With both safety intervals, the request becomes:
+
+```text
+LOWER_BOUND =
+LAST_CHANGED_AT - LOWER_SAFETY_INTERVAL
+
+UPPER_BOUND =
+REQUEST_START - UPPER_SAFETY_INTERVAL
+```
+
+and the source selection is:
+
+```text
+LOWER_BOUND < CHANGED_AT <= UPPER_BOUND
+```
+
+Conceptually:
+
+```text
+past                                                     now
+
+---- overlap ----|--------- new scan ---------|-- upper safety --|
+                 |                            |
+         LAST_CHANGED_AT                 UPPER_BOUND
+        /
+LOWER_BOUND
+```
+
+The three regions have different meanings:
+
+```text
+LOWER_BOUND < CHANGED_AT <= LAST_CHANGED_AT
+-> already scanned before
+-> intentionally re-read
+
+LAST_CHANGED_AT < CHANGED_AT <= UPPER_BOUND
+-> newly scanned region
+
+UPPER_BOUND < CHANGED_AT <= REQUEST_START
+-> intentionally delayed recent region
+```
+
+---
+
+### Why Re-Read the Past
+
+The lower interval gives the consumer another opportunity to see source rows close to the previous boundary.
+
+Suppose a previous request advanced:
+
+```text
+LAST_CHANGED_AT = T0
+```
+
+The next request does not start exactly at `T0`.
+
+Instead, it may restart from:
+
+```text
+T0 - 5 minutes
+```
+
+This means that rows near the previous boundary can appear again.
+
+The mechanism therefore prefers:
+
+```text
+possible duplicate delivery
+```
+
+over:
+
+```text
+a perfectly non-overlapping sequence of requests
+```
+
+---
+
+### Pointer Does Not Move Backward
+
+The lower boundary is temporary.
+
+It affects only the current selection.
+
+The persistent pointer remains:
+
+```text
+LAST_CHANGED_AT
+```
+
+until the request completes successfully.
+
+For example:
+
+```text
+persistent pointer = 10:04:51
+lower safety       = 5 minutes
+
+LOWER_BOUND = 09:59:51
+```
+
+The request reads from:
+
+```text
+09:59:51
+```
+
+but the stored pointer is not changed to that value.
+
+After successful processing, the pointer moves forward to the new:
+
+```text
+UPPER_BOUND
+```
+
+Therefore:
+
+```text
+LOWER_BOUND
+-> request read boundary
+
+LAST_CHANGED_AT
+-> persistent consumer frontier
+```
+
+These values have different purposes.
+
+---
+
+### Repeated After-Images
+
+In the laboratory, the first successful safe request acquires rows such as:
+
+```text
+P1002/SOUTH
+P1008/SOUTH
+```
+
+After the request completes, the pointer advances.
+
+A later request calculates a lower boundary that reaches back into the timestamp range containing those same rows.
+
+As a result, the rows can be selected again.
+
+For example:
+
+```text
+Run A
+
+P1002/SOUTH  T1
+P1008/SOUTH  T2
+```
+
+and later:
+
+```text
+Run B
+
+P1002/SOUTH  T1
+P1008/SOUTH  T2
+```
+
+The acquisition table therefore contains multiple after-images of the same business keys under different:
+
+```text
+RUN_ID
+```
+
+values.
+
+This behavior is intentional.
+
+---
+
+### Duplicate Delivery Is Not Data Corruption
+
+The repeated rows are not necessarily incorrect data.
+
+They represent repeated delivery of the same current-state after-image.
+
+For example:
+
+```text
+P1002/SOUTH
+PRICE = 23.00
+```
+
+may be delivered twice.
+
+If the downstream target applies overwrite semantics:
+
+```text
+target value = source after-image
+```
+
+then processing the same value twice produces the same final state.
+
+Conceptually:
+
+```text
+apply 23.00
+apply 23.00 again
+```
+
+still results in:
+
+```text
+23.00
+```
+
+This makes duplicate delivery compatible with idempotent or overwrite-style processing.
+
+---
+
+### Additive Processing Is Different
+
+The same duplicate behavior can be dangerous for additive semantics.
+
+Suppose an extracted row means:
+
+```text
+add 10 units
+```
+
+instead of:
+
+```text
+current value = 10 units
+```
+
+If the row is delivered twice:
+
+```text
++10
++10
+```
+
+the target becomes:
+
+```text
++20
+```
+
+even though the business event occurred only once.
+
+Therefore lower-overlap timestamp delta is naturally compatible with:
+
+```text
+after-image / overwrite semantics
+```
+
+but requires additional duplicate handling for:
+
+```text
+additive
+non-idempotent
+event-based
+```
+
+processing.
+
+---
+
+### Current-State Semantics Matter
+
+The source in this laboratory is a mutable current-state table.
+
+A selected row represents:
+
+```text
+the current after-image of a business key
+```
+
+rather than:
+
+```text
+a unique business event
+```
+
+This makes controlled overlap practical.
+
+If the same row is re-read without any further source modification, the consumer receives the same current state again.
+
+This is fundamentally different from replaying a transactional event such as:
+
+```text
+SALE +100
+```
+
+where duplicate execution would change the business result.
+
+---
+
+### Lower Safety and Delayed Visibility
+
+The lower safety interval can also provide additional tolerance near a previous boundary.
+
+Suppose a row becomes visible slightly later than expected but its:
+
+```text
+CHANGED_AT
+```
+
+still lies within the overlap range.
+
+The next request may select it because the lower boundary has moved backward.
+
+This provides an additional opportunity for recovery.
+
+However, this protection is limited.
+
+---
+
+### Lower Safety Is Not an Unlimited Recovery Window
+
+Suppose:
+
+```text
+LAST_CHANGED_AT = 10:10
+LOWER_SAFETY_INTERVAL = 5 minutes
+```
+
+The next request begins from approximately:
+
+```text
+10:05
+```
+
+Now consider a transaction with:
+
+```text
+CHANGED_AT = 10:00
+```
+
+that becomes visible only after the pointer has already moved beyond:
+
+```text
+10:10
+```
+
+Its timestamp is already older than:
+
+```text
+LOWER_BOUND = 10:05
+```
+
+The overlap request will not recover it.
+
+Therefore:
+
+```text
+lower safety
+```
+
+does not eliminate the requirement for bounded source visibility lag.
+
+It only creates a finite reread window.
+
+---
+
+### Combined Protection
+
+The two safety intervals serve different purposes.
+
+Upper safety:
+
+```text
+delays the newest region
+```
+
+Lower safety:
+
+```text
+re-reads part of the previous region
+```
+
+Together:
+
+```text
+                 persistent pointer
+                        |
+                        v
+
+---- overlap -----------|-------- new region --------|-- delayed --|
+                        |                            |
+                 LAST_CHANGED_AT                UPPER_BOUND
+        ^
+        |
+   LOWER_BOUND
+```
+
+The resulting strategy is:
+
+```text
+do not trust the newest source time immediately
++
+do not trust the previous boundary only once
+```
+
+This is stronger than a simple non-overlapping timestamp high-water mark.
+
+---
+
+### Persistent Pointer Semantics
+
+After a successful request:
+
+```text
+LAST_CHANGED_AT = UPPER_BOUND
+```
+
+The lower safety interval does not change this rule.
+
+The pointer still means:
+
+```text
+latest source-time frontier
+that the consumer considers safely scanned
+```
+
+The overlap is reconstructed dynamically from that pointer:
+
+```text
+next LOWER_BOUND =
+LAST_CHANGED_AT - LOWER_SAFETY_INTERVAL
+```
+
+This keeps the persistent state simple.
+
+---
+
+### Example
+
+Assume:
+
+```text
+LAST_CHANGED_AT = 10:04:51
+
+LOWER_SAFETY_INTERVAL = 5 minutes
+UPPER_SAFETY_INTERVAL = 5 minutes
+
+REQUEST_START = 10:15:00
+```
+
+Then:
+
+```text
+LOWER_BOUND = 09:59:51
+UPPER_BOUND = 10:10:00
+```
+
+The request reads:
+
+```text
+09:59:51 < CHANGED_AT <= 10:10:00
+```
+
+This includes:
+
+```text
+09:59:51 .. 10:04:51
+-> overlap with previously processed source time
+
+10:04:51 .. 10:10:00
+-> newly scanned source time
+```
+
+After successful persistence:
+
+```text
+LAST_CHANGED_AT
+10:04:51 -> 10:10:00
+```
+
+The pointer moves only forward.
+
+---
+
+### Next Request
+
+Suppose the next request starts at:
+
+```text
+10:20:00
+```
+
+Then:
+
+```text
+LOWER_BOUND = 10:05:00
+UPPER_BOUND = 10:15:00
+```
+
+The new request reads:
+
+```text
+10:05:00 < CHANGED_AT <= 10:15:00
+```
+
+Part of the previous request:
+
+```text
+10:05:00 .. 10:10:00
+```
+
+is read again.
+
+The new region:
+
+```text
+10:10:00 .. 10:15:00
+```
+
+is scanned for the first time.
+
+This pattern repeats for every request.
+
+---
+
+### Controlled At-Least-Once Behavior
+
+At the acquisition boundary, lower overlap creates behavior similar to:
+
+```text
+at least once
+```
+
+for rows near the timestamp frontier.
+
+The consumer may receive:
+
+```text
+one copy
+or
+multiple copies
+```
+
+of the same after-image.
+
+The design therefore does not attempt to guarantee:
+
+```text
+exactly once delivery
+```
+
+at the extraction boundary.
+
+Instead, it relies on:
+
+```text
+safe replay
++
+idempotent downstream application
+```
+
+where appropriate.
+
+---
+
+### Why This Can Be Preferable
+
+Trying to eliminate every duplicate at the extraction boundary can make the design more fragile.
+
+Controlled rereading is often simpler than trying to construct a perfectly exact timestamp boundary from a source whose transaction visibility is not perfectly synchronized with timestamp assignment.
+
+The trade-off is explicit:
+
+```text
+more overlap
+-> more duplicate acquisition
+-> more protection near boundaries
+
+less overlap
+-> fewer duplicates
+-> stronger dependence on exact source timing
+```
+
+The correct balance depends on the source and target semantics.
+
+---
+
+### Lower Safety Does Not Replace Upper Safety
+
+It is important not to treat the lower safety interval as an alternative to the upper safety interval.
+
+Consider a transaction whose timestamp is:
+
+```text
+T1
+```
+
+but whose visibility is delayed long enough that the consumer repeatedly moves its pointer forward.
+
+If `T1` eventually falls outside the lower overlap range before the transaction becomes visible, the change can still be lost.
+
+Upper safety attempts to prevent the pointer from crossing such a timestamp too early.
+
+Lower safety provides repeated observation near the boundary.
+
+Therefore:
+
+```text
+upper safety
+-> protects before pointer advancement
+
+lower safety
+-> provides overlap after pointer advancement
+```
+
+They solve related but different problems.
+
+---
+
+### Bounded Visibility Lag Still Required
+
+Even with both intervals:
+
+```text
+LOWER_BOUND < CHANGED_AT <= UPPER_BOUND
+```
+
+the timestamp architecture still relies on a finite timing assumption.
+
+If source transaction visibility can be delayed arbitrarily long, then eventually a timestamp may become older than both:
+
+```text
+UPPER safety protection
+```
+
+and:
+
+```text
+LOWER overlap protection
+```
+
+before the corresponding transaction becomes visible.
+
+Therefore:
+
+```text
+finite upper safety
++
+finite lower overlap
+```
+
+cannot provide a strict guarantee against:
+
+```text
+unbounded delayed COMMIT
+```
+
+This limitation is architectural, not an implementation bug.
+
+---
+
+### Laboratory Values
+
+The project uses:
+
+```text
+LOWER_SAFETY_INTERVAL = 300 seconds
+UPPER_SAFETY_INTERVAL = 300 seconds
+```
+
+These values exist only to make the experiments observable.
+
+They are not production recommendations.
+
+Production values would need to be based on:
+
+```text
+source transaction duration
+visibility lag measurements
+timestamp precision
+request frequency
+acceptable latency
+duplicate-processing cost
+operational SLA
+```
+
+---
+
+### Result of the Experiment
+
+The lower-safety experiment demonstrates:
+
+```text
+previous pointer = T0
+
+next request starts from:
+T0 - LOWER_SAFETY_INTERVAL
+
+previously acquired rows near T0
+are selected again
+
+same business after-images
+are persisted under a new RUN_ID
+```
+
+The duplicate acquisition is expected.
+
+The experiment therefore establishes:
+
+```text
+Lower safety deliberately trades
+duplicate after-images
+for additional boundary tolerance.
+```
+
+The key distinction is:
+
+```text
+Upper safety
+-> delays recent source time
+
+Lower safety
+-> rereads recent past source time
+```
+
+Together they form the safe timestamp window:
+
+```text
+LOWER_BOUND < CHANGED_AT <= UPPER_BOUND
+```
+
+but their reliability still depends on a bounded source visibility contract.
+
+The next delta problem is different again:
+
+```text
+What happens when the source row disappears completely?
+```
+
+That question leads to physical and soft delete semantics.
