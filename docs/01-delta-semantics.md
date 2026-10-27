@@ -1956,3 +1956,744 @@ Instead of extracting up to the current request time, the consumer deliberately 
 That window gives delayed transactions time to commit before the delta pointer is allowed to move past their timestamps.
 
 
+## Upper Safety Interval
+
+The delayed-COMMIT experiment shows that the newest visible timestamp is not necessarily a safe delta boundary.
+
+A transaction may already have:
+
+```text
+CHANGED_AT = T1
+```
+
+while remaining uncommitted and therefore invisible to the extraction session.
+
+At the same time, another transaction with:
+
+```text
+CHANGED_AT = T2
+```
+
+where:
+
+```text
+T1 < T2
+```
+
+may commit earlier and become visible.
+
+If the consumer immediately advances its pointer to `T2`, the later-visible `T1` change can be lost.
+
+The upper safety interval addresses this problem by deliberately leaving the most recent time region unprocessed.
+
+---
+
+### Basic Idea
+
+Instead of reading all changes up to the current request time:
+
+```text
+LAST_CHANGED_AT < CHANGED_AT <= REQUEST_START
+```
+
+the consumer defines:
+
+```text
+UPPER_BOUND =
+REQUEST_START - UPPER_SAFETY_INTERVAL
+```
+
+and reads only:
+
+```text
+LAST_CHANGED_AT < CHANGED_AT <= UPPER_BOUND
+```
+
+The interval:
+
+```text
+UPPER_BOUND < CHANGED_AT <= REQUEST_START
+```
+
+is intentionally excluded from the current request.
+
+This is the upper safety zone.
+
+---
+
+### Safety Zone
+
+Assume:
+
+```text
+REQUEST_START = 10:10:00
+UPPER_SAFETY_INTERVAL = 5 minutes
+```
+
+Then:
+
+```text
+UPPER_BOUND = 10:05:00
+```
+
+The consumer may safely scan only:
+
+```text
+CHANGED_AT <= 10:05:00
+```
+
+while changes in:
+
+```text
+10:05:00 < CHANGED_AT <= 10:10:00
+```
+
+remain outside the current request.
+
+Conceptually:
+
+```text
+past                                      now
+
+--------- safe scan ---------|--- safety zone ---|
+                             |
+                         UPPER_BOUND
+```
+
+The consumer intentionally accepts additional latency in exchange for a stronger visibility guarantee.
+
+---
+
+### Why the Delay Helps
+
+Consider again a delayed source transaction.
+
+Session B performs:
+
+```text
+UPDATE P1002/SOUTH
+PRICE      = 23.00
+CHANGED_AT = T1
+```
+
+but does not commit immediately.
+
+A second session creates:
+
+```text
+P1008/SOUTH
+PRICE      = 80.00
+CHANGED_AT = T2
+```
+
+and commits it.
+
+As before:
+
+```text
+T1 < T2
+```
+
+but:
+
+```text
+T2 becomes visible before T1
+```
+
+With the naive reader, `T2` could move the pointer beyond `T1`.
+
+With an upper safety interval, both timestamps may still lie inside the protected recent region:
+
+```text
+T1 > UPPER_BOUND
+T2 > UPPER_BOUND
+```
+
+The current request therefore selects neither row.
+
+The consumer does not advance beyond them.
+
+---
+
+### Waiting for the Safety Zone to Move
+
+Time passes.
+
+The delayed transaction commits.
+
+A later extraction request starts at a newer time:
+
+```text
+REQUEST_START = T3
+```
+
+and computes:
+
+```text
+UPPER_BOUND =
+T3 - UPPER_SAFETY_INTERVAL
+```
+
+Eventually:
+
+```text
+T1 <= UPPER_BOUND
+T2 <= UPPER_BOUND
+```
+
+Both changes now lie in the extractable region.
+
+Because the delayed transaction has already committed, the consumer can see:
+
+```text
+P1002/SOUTH  T1
+P1008/SOUTH  T2
+```
+
+in the same request.
+
+The time boundary therefore moves forward only after the source has had additional time to make older transactions visible.
+
+---
+
+### Laboratory Selection Rule
+
+The safe timestamp reader uses:
+
+```text
+CHANGED_AT > LAST_CHANGED_AT
+AND
+CHANGED_AT <= UPPER_BOUND
+```
+
+before lower overlap is introduced.
+
+Conceptually:
+
+```text
+LAST_CHANGED_AT
+        |
+        | extractable region
+        v
+--------+--------------------+---------- REQUEST_START
+                             |
+                         UPPER_BOUND
+                             |
+                             +---- recent region not yet scanned
+```
+
+This changes the meaning of pointer advancement.
+
+The consumer is no longer asking:
+
+```text
+What is the newest visible timestamp?
+```
+
+It is asking:
+
+```text
+Up to what time boundary am I prepared
+to declare the source safely scanned?
+```
+
+---
+
+### Pointer Advances to the Boundary
+
+An important property of the safe reader is that the persistent pointer represents the scanned time boundary:
+
+```text
+LAST_CHANGED_AT = UPPER_BOUND
+```
+
+after a successful request.
+
+It does not necessarily become:
+
+```text
+MAX( CHANGED_AT )
+```
+
+from the rows returned by that request.
+
+These are different concepts.
+
+---
+
+### Empty Request Can Still Advance the Pointer
+
+Suppose:
+
+```text
+old LAST_CHANGED_AT = 09:30
+UPPER_BOUND          = 09:35
+```
+
+and no source rows exist with:
+
+```text
+09:30 < CHANGED_AT <= 09:35
+```
+
+The request returns:
+
+```text
+0 rows
+```
+
+but the interval has still been successfully scanned.
+
+The consumer may therefore advance:
+
+```text
+LAST_CHANGED_AT
+09:30 -> 09:35
+```
+
+This is correct because the pointer means:
+
+```text
+source time successfully scanned
+```
+
+rather than:
+
+```text
+timestamp of the last row received
+```
+
+This distinction is important for safety-window delta processing.
+
+---
+
+### Pointer as a Time Frontier
+
+The safe timestamp pointer can therefore be interpreted as a frontier:
+
+```text
+everything at or before LAST_CHANGED_AT
+has been declared processed
+according to the visibility contract
+```
+
+The next request extends that frontier:
+
+```text
+old frontier
+     |
+     v
+-----+---------------------+--------->
+                           |
+                      new UPPER_BOUND
+```
+
+After successful completion:
+
+```text
+new frontier = UPPER_BOUND
+```
+
+whether the interval contained:
+
+```text
+many rows
+one row
+zero rows
+```
+
+---
+
+### Reproducing the Experiment
+
+The laboratory reproduces the delayed-COMMIT scenario using two sessions.
+
+The delayed transaction assigns approximately:
+
+```text
+T1 = 10:00:50
+```
+
+and remains uncommitted.
+
+A later transaction commits approximately at:
+
+```text
+T2 = 10:01:13
+```
+
+The safe reader initially calculates upper boundaries that are still earlier than both changes, for example:
+
+```text
+UPPER_BOUND = 09:59:16
+```
+
+and later:
+
+```text
+UPPER_BOUND = 10:00:32
+```
+
+The requests select:
+
+```text
+0 rows
+```
+
+because the protected region has not yet moved past the source changes.
+
+The pointer can still advance to each successfully scanned `UPPER_BOUND`.
+
+After the delayed transaction commits and sufficient time passes, a later request calculates approximately:
+
+```text
+REQUEST_START = 10:09:51
+UPPER_BOUND   = 10:04:51
+```
+
+Now:
+
+```text
+T1 <= 10:04:51
+T2 <= 10:04:51
+```
+
+and both rows are visible.
+
+The reader selects:
+
+```text
+P1002/SOUTH  T1
+P1008/SOUTH  T2
+```
+
+The previously demonstrated loss no longer occurs.
+
+---
+
+### What the Upper Safety Interval Guarantees
+
+The mechanism works if the source satisfies a bounded visibility-lag contract.
+
+Let:
+
+```text
+D
+```
+
+be the maximum possible delay between:
+
+```text
+assigning CHANGED_AT
+```
+
+and:
+
+```text
+the transaction becoming committed and visible
+to the extraction session
+```
+
+Then the upper safety interval must be large enough to cover that delay:
+
+```text
+UPPER_SAFETY_INTERVAL >= D
+```
+
+subject to the exact timestamp and transaction semantics of the source system.
+
+Under that assumption, when a timestamp passes behind:
+
+```text
+UPPER_BOUND
+```
+
+all relevant transactions carrying that timestamp should already be visible.
+
+Only then is it safe to move the time frontier beyond them.
+
+---
+
+### The Guarantee Is Conditional
+
+The upper safety interval is not a universal solution.
+
+Its correctness depends on the existence of a finite maximum visibility lag.
+
+Suppose the safety interval is:
+
+```text
+5 minutes
+```
+
+but a source transaction can remain open for:
+
+```text
+20 minutes
+```
+
+after assigning `CHANGED_AT`.
+
+Then the consumer may eventually move:
+
+```text
+UPPER_BOUND
+```
+
+past that transaction's timestamp while the transaction is still invisible.
+
+The original failure becomes possible again.
+
+Therefore:
+
+```text
+finite upper safety
++
+unbounded visibility lag
+=
+no strict lossless guarantee
+```
+
+---
+
+### Larger Safety Interval vs Latency
+
+Increasing the safety interval provides more protection.
+
+For example:
+
+```text
+1 minute
+5 minutes
+30 minutes
+2 hours
+```
+
+progressively reduce the risk that an old timestamp still belongs to an uncommitted transaction.
+
+But the cost is acquisition latency.
+
+With:
+
+```text
+UPPER_SAFETY_INTERVAL = 30 minutes
+```
+
+a newly committed change may intentionally wait up to approximately 30 minutes before becoming eligible for extraction.
+
+Therefore the parameter represents a trade-off:
+
+```text
+larger safety interval
+-> stronger tolerance for delayed visibility
+-> higher data latency
+
+smaller safety interval
+-> lower latency
+-> stronger requirement on source transaction duration
+```
+
+---
+
+### Safety Value Must Come from the Source Contract
+
+The laboratory uses:
+
+```text
+UPPER_SAFETY_INTERVAL = 300 seconds
+```
+
+only because five minutes makes the experiment easy to observe.
+
+This is not a production recommendation.
+
+A real value must be based on source-system behavior such as:
+
+```text
+maximum transaction duration
+batch commit behavior
+locking patterns
+database isolation
+application processing time
+operational SLA
+```
+
+The correct configuration therefore cannot be determined from the extractor alone.
+
+It is part of the interface contract between source and consumer.
+
+---
+
+### Upper Safety Does Not Require Duplicate Delivery
+
+The upper safety interval moves the upper boundary backward.
+
+It does not, by itself, move the lower boundary backward.
+
+If the previous pointer is:
+
+```text
+LAST_CHANGED_AT = T0
+```
+
+and the new safe boundary is:
+
+```text
+UPPER_BOUND = T1
+```
+
+the request can read:
+
+```text
+T0 < CHANGED_AT <= T1
+```
+
+without intentionally rereading the already processed region.
+
+The mechanism therefore primarily introduces:
+
+```text
+latency
+```
+
+rather than:
+
+```text
+overlap
+```
+
+Intentional overlap is introduced separately by the lower safety interval.
+
+---
+
+### Upper Safety and Consumer Atomicity
+
+The same transaction rule still applies:
+
+```text
+persist selected rows
+        |
+        v
+advance LAST_CHANGED_AT to UPPER_BOUND
+        |
+        v
+COMMIT
+```
+
+If persistence or pointer update fails:
+
+```text
+ROLLBACK
+```
+
+leaves the previous pointer unchanged.
+
+The interval can then be scanned again.
+
+The upper safety interval protects the source-side visibility boundary.
+
+Consumer transaction atomicity protects restart behavior.
+
+These are complementary guarantees.
+
+---
+
+### Architectural Meaning
+
+The upper safety interval changes the timestamp-delta model from:
+
+```text
+extract everything visible up to now
+```
+
+to:
+
+```text
+extract only the part of source time
+that is old enough to be considered stable
+```
+
+This is the essential idea.
+
+The consumer intentionally stays behind real time so that:
+
+```text
+timestamp assignment
+```
+
+and:
+
+```text
+transaction visibility
+```
+
+have time to converge.
+
+---
+
+### Result of the Experiment
+
+The delayed-COMMIT scenario changes from:
+
+```text
+Naive delta:
+
+T1 uncommitted
+T2 committed
+consumer sees T2
+pointer -> T2
+T1 commits later
+T1 lost
+```
+
+to:
+
+```text
+Upper-safety delta:
+
+T1 uncommitted
+T2 committed
+
+both still inside recent safety zone
+consumer does not move past them
+
+T1 commits
+
+time advances
+T1 and T2 move behind UPPER_BOUND
+
+consumer sees both
+pointer -> safe time boundary
+```
+
+The experiment therefore demonstrates:
+
+```text
+An upper safety interval can protect timestamp delta
+against delayed COMMIT
+when the maximum source visibility lag is bounded
+by the configured safety window.
+```
+
+It also establishes an important semantic change:
+
+```text
+LAST_CHANGED_AT
+```
+
+should be understood as:
+
+```text
+the latest source-time boundary
+successfully and safely scanned
+```
+
+rather than simply:
+
+```text
+the maximum timestamp returned by the previous request
+```
+
+The next step is to extend this model with a lower safety interval, which intentionally rereads part of the already scanned time range and introduces controlled overlap
+
+
