@@ -6257,3 +6257,981 @@ That is examined in:
 ```text
 Consumer Restart and Replay
 ```
+
+## Consumer Restart and Replay
+
+A reliable change-log architecture must remain correct not only while the consumer is running normally, but also when the consumer stops unexpectedly.
+
+The critical question is:
+
+```text
+What happens if the consumer has already read
+and persisted some events,
+but fails before advancing LAST_SEQ?
+```
+
+The system must be able to restart without losing committed source events.
+
+This requires the consumer to treat:
+
+```text
+acquisition persistence
+```
+
+and:
+
+```text
+delta-pointer advancement
+```
+
+as one atomic database transaction.
+
+---
+
+### Consumer State Before the Experiment
+
+Assume the change-log consumer currently stores:
+
+```text
+LAST_SEQ = 1004
+```
+
+The producer has already committed additional events:
+
+```text
+1005  P1001/SOUTH  U  14.00
+1006  P1001/SOUTH  U  15.00
+```
+
+These events exist durably in:
+
+```text
+ZDB_CHANGE_LOG
+```
+
+but have not yet been successfully acquired.
+
+The source-side state is therefore:
+
+```text
+Producer LAST_EVENT_SEQ = 1006
+Consumer LAST_SEQ       = 1004
+```
+
+The difference:
+
+```text
+1005
+1006
+```
+
+represents the current acquisition backlog.
+
+---
+
+### Normal Consumer Flow
+
+The consumer reads:
+
+```text
+EVENT_SEQ > LAST_SEQ
+ORDER BY EVENT_SEQ
+```
+
+With:
+
+```text
+LAST_SEQ = 1004
+```
+
+the result is:
+
+```text
+1005
+1006
+```
+
+The intended processing sequence is:
+
+```text
+read events
+        |
+        v
+persist acquired events
+        |
+        v
+advance LAST_SEQ
+        |
+        v
+COMMIT
+```
+
+The acquisition rows and the new pointer belong to the same LUW.
+
+---
+
+### Why the Order Matters
+
+A dangerous implementation would do:
+
+```text
+advance LAST_SEQ
+        |
+        v
+COMMIT
+        |
+        v
+persist acquired events
+```
+
+Suppose the consumer advances:
+
+```text
+LAST_SEQ
+1004 -> 1006
+```
+
+and commits that state.
+
+If the process then fails before persisting events `1005` and `1006`, the next request starts with:
+
+```text
+EVENT_SEQ > 1006
+```
+
+The source events still exist, but they are now behind the consumer pointer.
+
+They will not be selected again.
+
+This would create permanent data loss.
+
+---
+
+### Safe Processing Order
+
+The laboratory therefore uses the opposite order:
+
+```text
+persist events
+        |
+        v
+advance LAST_SEQ
+        |
+        v
+COMMIT both together
+```
+
+The key property is:
+
+```text
+no committed pointer advancement
+without committed acquisition persistence
+```
+
+If the LUW fails before `COMMIT`, neither change becomes durable.
+
+---
+
+### Restart Experiment
+
+The experiment intentionally interrupts the consumer after:
+
+```text
+INSERT acquisition rows
+```
+
+but before:
+
+```text
+UPDATE LAST_SEQ
+```
+
+and before:
+
+```text
+COMMIT
+```
+
+At that point, inside the consumer session:
+
+```text
+ZDB_ACQ_PRICE
+contains uncommitted rows for 1005 and 1006
+```
+
+while:
+
+```text
+ZDB_DELTA_STATE-LAST_SEQ
+still represents 1004
+```
+
+The consumer session is then terminated.
+
+Because no commit occurred, the database rolls back the incomplete LUW.
+
+---
+
+### State After Interruption
+
+After the failed consumer run:
+
+```text
+ZDB_CHANGE_LOG
+```
+
+still contains:
+
+```text
+1005
+1006
+```
+
+because these events were committed independently by the producer before the consumer started.
+
+The acquisition table does not contain committed copies of the interrupted rows:
+
+```text
+ZDB_ACQ_PRICE
+-> no committed 1005
+-> no committed 1006
+```
+
+The consumer pointer remains:
+
+```text
+LAST_SEQ = 1004
+```
+
+The resulting state is therefore:
+
+```text
+source events durable
+consumer persistence rolled back
+consumer pointer unchanged
+```
+
+This is exactly the state required for safe restart.
+
+---
+
+### Replay After Restart
+
+The consumer is started again.
+
+It again evaluates:
+
+```text
+EVENT_SEQ > 1004
+```
+
+and therefore selects:
+
+```text
+1005
+1006
+```
+
+The same source events are replayed.
+
+This time the consumer completes successfully:
+
+```text
+persist 1005
+persist 1006
+update LAST_SEQ = 1006
+COMMIT
+```
+
+The final state becomes:
+
+```text
+ZDB_ACQ_PRICE
+-> 1005 persisted
+-> 1006 persisted
+
+ZDB_DELTA_STATE
+-> LAST_SEQ = 1006
+```
+
+The source events have now been successfully acknowledged by the consumer.
+
+---
+
+### Replay Is Expected Behavior
+
+The second selection of:
+
+```text
+1005
+1006
+```
+
+is not an error.
+
+It is the intended recovery mechanism.
+
+Before the consumer transaction commits, the system must behave as if the request has not been completed.
+
+Therefore:
+
+```text
+before COMMIT
+-> events remain replayable
+
+after COMMIT
+-> pointer moves beyond them
+```
+
+This creates a clear acknowledgement boundary.
+
+---
+
+### Commit as the Consumer Acknowledgement
+
+For the consumer, the effective acknowledgement of an event is not:
+
+```text
+event selected
+```
+
+and not:
+
+```text
+event inserted into an uncommitted table buffer
+```
+
+It is:
+
+```text
+event persistence
++
+pointer advancement
++
+COMMIT
+```
+
+Only after that point may the consumer safely exclude the event from future requests.
+
+---
+
+### Durable Source Log Enables Replay
+
+Replay is possible because:
+
+```text
+ZDB_CHANGE_LOG
+```
+
+is a durable source-side event store.
+
+The consumer does not remove events when it reads them.
+
+Therefore a failed consumer does not destroy the source evidence needed for recovery.
+
+The consumer pointer simply determines which committed events are still considered unprocessed.
+
+This is a major advantage of separating:
+
+```text
+source event durability
+```
+
+from:
+
+```text
+consumer progress
+```
+
+---
+
+### Producer and Consumer Transactions Are Independent
+
+The producer commits its event first:
+
+```text
+producer transaction
+        |
+        v
+ZDB_CHANGE_LOG durable
+```
+
+Later, the consumer performs its own transaction:
+
+```text
+consumer transaction
+        |
+        v
+ZDB_ACQ_PRICE
++
+ZDB_DELTA_STATE
+```
+
+The producer does not wait for the consumer.
+
+Likewise, a consumer rollback does not affect already committed source events.
+
+This separation allows:
+
+```text
+producer progress
+```
+
+and:
+
+```text
+consumer recovery
+```
+
+to evolve independently.
+
+---
+
+### Pointer as an Acknowledgement Boundary
+
+For the change-log consumer:
+
+```text
+LAST_SEQ
+```
+
+can be interpreted as:
+
+```text
+all events up to this sequence
+have been successfully committed
+to the acquisition layer
+```
+
+If:
+
+```text
+LAST_SEQ = 1004
+```
+
+then:
+
+```text
+1005+
+```
+
+remain unacknowledged.
+
+If the consumer successfully commits:
+
+```text
+1005
+1006
+```
+
+then:
+
+```text
+LAST_SEQ = 1006
+```
+
+becomes the new acknowledgement boundary.
+
+---
+
+### Why Selecting Events Is Not Enough
+
+A consumer may successfully execute:
+
+```text
+SELECT EVENT_SEQ > LAST_SEQ
+```
+
+and still fail later.
+
+Possible failures include:
+
+```text
+persistence error
+database exception
+session termination
+application error
+manual debug termination
+pointer-update failure
+```
+
+Therefore the extraction query itself cannot define completion.
+
+Completion must be tied to durable persistence.
+
+---
+
+### Why Persisting Events Alone Is Not Enough
+
+The opposite partial state is also undesirable.
+
+Suppose the consumer commits acquired rows but fails to advance:
+
+```text
+LAST_SEQ
+```
+
+Then the next request selects the same events again.
+
+This may create duplicates in the acquisition layer.
+
+Depending on downstream semantics, such duplication may be recoverable, but it is unnecessary.
+
+The stronger design is:
+
+```text
+acquisition rows
++
+consumer pointer
+```
+
+in the same LUW.
+
+This ensures that they move together.
+
+---
+
+### Atomicity Invariant
+
+The consumer should preserve the invariant:
+
+```text
+For every committed LAST_SEQ = N,
+all events <= N required by this consumer
+have already been successfully persisted.
+```
+
+The reverse also holds for the laboratory flow:
+
+```text
+If persistence of events up to N is rolled back,
+LAST_SEQ must remain below N.
+```
+
+This makes the pointer trustworthy.
+
+---
+
+### Failure Before Persistence
+
+If the consumer fails before writing any acquisition rows:
+
+```text
+no acquisition data committed
+LAST_SEQ unchanged
+```
+
+The next run simply selects the same events again.
+
+This is straightforward replay.
+
+---
+
+### Failure After Persistence but Before Pointer Update
+
+This is the laboratory restart experiment.
+
+Because both operations belong to one LUW:
+
+```text
+uncommitted acquisition rows
+```
+
+are rolled back.
+
+The pointer remains unchanged.
+
+The same events are replayed.
+
+---
+
+### Failure After Pointer Update but Before COMMIT
+
+Even if the code has already executed:
+
+```text
+UPDATE ZDB_DELTA_STATE
+```
+
+inside the transaction, a failure before:
+
+```text
+COMMIT
+```
+
+still rolls back both:
+
+```text
+acquisition persistence
+```
+
+and:
+
+```text
+pointer update
+```
+
+The restart behavior remains safe.
+
+The important boundary is the database commit, not the execution order of individual SQL statements inside the LUW.
+
+---
+
+### Failure After COMMIT
+
+If the consumer fails after:
+
+```text
+COMMIT
+```
+
+then:
+
+```text
+acquisition rows
+```
+
+and:
+
+```text
+LAST_SEQ
+```
+
+are already durable.
+
+The next consumer run begins after the committed pointer and does not replay those events.
+
+This is also correct because the acquisition was successfully completed before the failure.
+
+---
+
+### At-Least-Once Selection, Atomic Completion
+
+From the perspective of source selection, an event may be read more than once if the consumer repeatedly fails before commit.
+
+For example:
+
+```text
+run 1:
+select 1005
+fail before COMMIT
+
+run 2:
+select 1005
+fail before COMMIT
+
+run 3:
+select 1005
+COMMIT
+```
+
+The event is selected multiple times but committed once to the acquisition state.
+
+The architecture therefore tolerates repeated attempts while preserving a single committed progress boundary.
+
+---
+
+### Change-Log Retention Requirement
+
+Replay works only while the required source events remain available.
+
+If the producer deletes:
+
+```text
+1005
+1006
+```
+
+from:
+
+```text
+ZDB_CHANGE_LOG
+```
+
+before the consumer has advanced beyond them, restart recovery becomes impossible.
+
+Therefore event retention must respect consumer progress.
+
+Conceptually:
+
+```text
+do not purge event N
+while any required consumer may still need N
+```
+
+The laboratory does not implement retention management, but the architectural requirement remains.
+
+---
+
+### Multiple Consumers
+
+A production event log may have several independent consumers:
+
+```text
+Consumer A LAST_SEQ = 1006
+Consumer B LAST_SEQ = 1003
+Consumer C LAST_SEQ = 1005
+```
+
+In that case, event retention must consider the slowest required consumer.
+
+For example:
+
+```text
+event 1004
+```
+
+cannot be removed if Consumer B may still need it.
+
+The laboratory uses only one logical consumer and therefore does not implement this consumer-group model.
+
+---
+
+### Consumer Concurrency
+
+The laboratory also assumes:
+
+```text
+one active consumer
+for PRODUCT_PRICE_LOG
+```
+
+If two consumers use the same:
+
+```text
+LAST_SEQ
+```
+
+concurrently, additional coordination would be required.
+
+For example, both could read:
+
+```text
+LAST_SEQ = 1004
+```
+
+and process the same events simultaneously.
+
+This does not necessarily cause source-event loss, but it can create duplicate acquisition and pointer races.
+
+Consumer concurrency control is outside the current laboratory scope.
+
+---
+
+### Restart vs Reinitialization
+
+Restart and reinitialization are different operations.
+
+Restart means:
+
+```text
+continue from the last committed LAST_SEQ
+```
+
+For example:
+
+```text
+LAST_SEQ = 1004
+-> replay 1005+
+```
+
+Reinitialization means deliberately resetting the consumer pointer:
+
+```text
+LAST_SEQ = 1000
+```
+
+and replaying the log from an earlier boundary.
+
+The laboratory provides:
+
+```text
+ZCL_DB_LOG_DELTA_INIT
+```
+
+for explicit reinitialization.
+
+It should not be confused with ordinary restart behavior.
+
+---
+
+### Replaying Previously Committed Events
+
+If the consumer pointer is intentionally reset from:
+
+```text
+1006
+```
+
+to:
+
+```text
+1000
+```
+
+then:
+
+```text
+1001 .. 1006
+```
+
+become eligible again.
+
+This is a deliberate replay.
+
+It may be useful for:
+
+```text
+testing
+reconstruction
+recovery
+rebuilding a downstream target
+```
+
+but it can also create duplicate downstream effects unless processing is designed accordingly.
+
+The laboratory uses this capability only as an explicit test operation.
+
+---
+
+### Comparison with Timestamp Replay
+
+Timestamp delta uses overlap such as:
+
+```text
+LOWER_BOUND =
+LAST_CHANGED_AT - LOWER_SAFETY_INTERVAL
+```
+
+to create controlled rereading.
+
+The change-log consumer does not need routine overlap for boundary correctness.
+
+Replay occurs instead when:
+
+```text
+LAST_SEQ has not advanced
+```
+
+because the previous consumer LUW did not commit.
+
+This is more precise.
+
+The source event identity:
+
+```text
+EVENT_SEQ
+```
+
+remains stable across retries.
+
+---
+
+### Exact Event Identity
+
+Because each log event has its own:
+
+```text
+EVENT_SEQ
+```
+
+the consumer can distinguish:
+
+```text
+replay of event 1005
+```
+
+from:
+
+```text
+a new business event 1006
+```
+
+This is different from a current-state timestamp reread, where the same business key may simply appear again as an after-image.
+
+Explicit event identity makes recovery behavior easier to reason about.
+
+---
+
+### Result of the Experiment
+
+The laboratory restart experiment starts with:
+
+```text
+Consumer LAST_SEQ = 1004
+```
+
+and committed source events:
+
+```text
+1005  P1001/SOUTH  U  14.00
+1006  P1001/SOUTH  U  15.00
+```
+
+The consumer:
+
+```text
+selects 1005 and 1006
+persists them inside its LUW
+is interrupted before COMMIT
+```
+
+After termination:
+
+```text
+ZDB_CHANGE_LOG
+-> 1005 and 1006 remain committed
+
+ZDB_ACQ_PRICE
+-> interrupted rows not committed
+
+ZDB_DELTA_STATE
+-> LAST_SEQ remains 1004
+```
+
+The consumer is restarted.
+
+It again selects:
+
+```text
+1005
+1006
+```
+
+and this time commits:
+
+```text
+acquisition rows
++
+LAST_SEQ = 1006
+```
+
+The experiment therefore demonstrates:
+
+```text
+Consumer restart is safe when
+acquisition persistence and pointer advancement
+are committed atomically.
+```
+
+The key rule is:
+
+```text
+Never acknowledge an event in LAST_SEQ
+before the corresponding acquired data
+is durably committed.
+```
+
+The next reliability question is on the producer side:
+
+```text
+What happens if the business change succeeds,
+but writing the corresponding change-log event fails?
+```
+
+That is examined in:
+
+```text
+Producer Rollback on Change-Log Failure
+```
+```
