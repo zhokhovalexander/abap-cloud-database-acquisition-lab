@@ -7235,3 +7235,1736 @@ That is examined in:
 Producer Rollback on Change-Log Failure
 ```
 ```
+## Producer Rollback on Change-Log Failure
+
+The transactional change-log architecture depends on a strong producer-side invariant:
+
+```text
+event-sequence advancement
++
+business-state change
++
+change-log event
+```
+
+must either all commit together or all roll back together.
+
+It is not sufficient for the producer to create the correct event under normal conditions.
+
+The architecture must also remain consistent when one of the database operations fails after earlier operations in the same producer transaction have already succeeded.
+
+The laboratory reproduces this case by deliberately forcing the change-log insert to fail.
+
+---
+
+### Producer Transaction Boundary
+
+A normal producer update performs:
+
+```text
+acquire counter lock
+        |
+        v
+allocate next EVENT_SEQ
+        |
+        v
+update ZDB_EVENT_COUNT
+        |
+        v
+update ZDB_SRC_PRICE
+        |
+        v
+insert ZDB_CHANGE_LOG event
+        |
+        v
+COMMIT
+        |
+        v
+release lock
+```
+
+The important point is that:
+
+```text
+counter update
+business update
+change-log insert
+```
+
+belong to the same database LUW.
+
+Before `COMMIT`, none of them represents durable producer progress.
+
+---
+
+### Initial State
+
+Before the failure experiment, assume:
+
+```text
+ZDB_EVENT_COUNT
+LAST_EVENT_SEQ = 1006
+```
+
+and the current business state is:
+
+```text
+P1001/SOUTH
+PRICE = 15.00
+```
+
+The next legitimate producer event would therefore receive:
+
+```text
+EVENT_SEQ = 1007
+```
+
+---
+
+### Preparing the Failure
+
+The laboratory uses:
+
+```text
+ZCL_DB_LOG_FAIL_PREP
+```
+
+to create a deliberate conflict.
+
+The preparation class determines the next expected sequence:
+
+```text
+LAST_EVENT_SEQ + 1
+```
+
+which in this example is:
+
+```text
+1007
+```
+
+It then inserts and commits an artificial change-log row:
+
+```text
+SOURCE_NAME = PRODUCT_PRICE_LOG
+EVENT_SEQ   = 1007
+PRODUCT_ID  = PFAIL
+STORE_GROUP = TEST
+OPERATION   = I
+PRICE       = 999.00
+```
+
+The producer counter is not changed.
+
+The resulting state is intentionally inconsistent from a business perspective:
+
+```text
+Producer counter:
+1006
+
+Change log:
+contains artificial row 1007
+```
+
+This condition exists only to force a database error in the next producer transaction.
+
+---
+
+### Producer Starts Normally
+
+The normal update producer is then executed.
+
+It acquires:
+
+```text
+EZDBEVCOUNT
+```
+
+and reads:
+
+```text
+LAST_EVENT_SEQ = 1006
+```
+
+It therefore allocates:
+
+```text
+EVENT_SEQ = 1007
+```
+
+Inside the producer LUW it first updates the counter:
+
+```text
+1006 -> 1007
+```
+
+and then applies the business change:
+
+```text
+P1001/SOUTH
+PRICE 15.00 -> 16.00
+```
+
+At this point, inside the still-uncommitted transaction:
+
+```text
+counter = 1007
+business price = 16.00
+```
+
+The producer then attempts to insert the corresponding log event.
+
+---
+
+### Change-Log Insert Fails
+
+The intended event is:
+
+```text
+EVENT_SEQ   = 1007
+PRODUCT_ID  = P1001
+STORE_GROUP = SOUTH
+OPERATION   = U
+PRICE       = 16.00
+```
+
+However, the artificial preparation row already occupies the primary-key position for:
+
+```text
+PRODUCT_PRICE_LOG
++
+EVENT_SEQ 1007
+```
+
+The insert therefore fails with a duplicate-key conflict.
+
+This reproduces an important failure point:
+
+```text
+some earlier producer SQL operations succeeded
+but the event could not be persisted
+```
+
+---
+
+### Why Partial Commit Would Be Dangerous
+
+If the producer were to preserve the earlier changes despite the failed log insert, the source could become:
+
+```text
+ZDB_EVENT_COUNT
+LAST_EVENT_SEQ = 1007
+
+ZDB_SRC_PRICE
+P1001/SOUTH = 16.00
+
+ZDB_CHANGE_LOG
+no legitimate U event 1007
+```
+
+The business state would have changed without a corresponding event.
+
+The change-log consumer would never learn about:
+
+```text
+15.00 -> 16.00
+```
+
+This would violate the fundamental producer contract.
+
+---
+
+### Rollback
+
+The producer error path therefore executes:
+
+```text
+ROLLBACK
+```
+
+Because the counter update and business update belong to the same LUW as the failed log insert, they are reversed.
+
+After rollback:
+
+```text
+ZDB_EVENT_COUNT
+LAST_EVENT_SEQ = 1006
+```
+
+and:
+
+```text
+ZDB_SRC_PRICE
+
+P1001/SOUTH
+PRICE = 15.00
+```
+
+The legitimate event:
+
+```text
+1007  P1001/SOUTH  U  16.00
+```
+
+does not exist.
+
+The producer transaction has therefore left no committed partial state.
+
+---
+
+### The Artificial Conflict Remains
+
+The fake row:
+
+```text
+1007  PFAIL/TEST
+```
+
+does remain in:
+
+```text
+ZDB_CHANGE_LOG
+```
+
+This is expected.
+
+It was committed by:
+
+```text
+ZCL_DB_LOG_FAIL_PREP
+```
+
+before the failing producer transaction began.
+
+The producer rollback cannot undo an earlier independent committed transaction.
+
+This distinction is important:
+
+```text
+ROLLBACK
+```
+
+affects only the current LUW.
+
+---
+
+### State After Producer Failure
+
+Immediately after the failed producer attempt:
+
+```text
+Producer counter:
+LAST_EVENT_SEQ = 1006
+
+Business state:
+P1001/SOUTH = 15.00
+
+Legitimate event 1007:
+not created
+
+Artificial conflict:
+1007 PFAIL/TEST still present
+```
+
+The key producer invariant has been preserved:
+
+```text
+No committed business change exists
+without its corresponding committed log event.
+```
+
+---
+
+### Cleanup
+
+The laboratory then runs:
+
+```text
+ZCL_DB_LOG_FAIL_CLEANUP
+```
+
+The cleanup removes the artificial:
+
+```text
+PFAIL/TEST
+```
+
+record from the change log.
+
+The cleanup intentionally identifies the artificial record by:
+
+```text
+PRODUCT_ID  = PFAIL
+STORE_GROUP = TEST
+```
+
+rather than relying on a hard-coded event sequence.
+
+This makes cleanup independent of the current producer counter.
+
+---
+
+### Retry
+
+After the artificial conflict is removed, the normal producer is executed again.
+
+The committed counter is still:
+
+```text
+LAST_EVENT_SEQ = 1006
+```
+
+because the previous attempt rolled back.
+
+Therefore the retry allocates:
+
+```text
+EVENT_SEQ = 1007
+```
+
+again.
+
+This reuse is correct.
+
+The failed `1007` event never became part of the committed producer stream.
+
+---
+
+### Successful Retry
+
+The producer now performs:
+
+```text
+counter:
+1006 -> 1007
+```
+
+then:
+
+```text
+business state:
+
+P1001/SOUTH
+15.00 -> 16.00
+```
+
+and inserts:
+
+```text
+1007
+P1001/SOUTH
+U
+16.00
+```
+
+into:
+
+```text
+ZDB_CHANGE_LOG
+```
+
+The complete producer transaction commits successfully.
+
+The resulting state is:
+
+```text
+ZDB_EVENT_COUNT
+LAST_EVENT_SEQ = 1007
+
+ZDB_SRC_PRICE
+P1001/SOUTH = 16.00
+
+ZDB_CHANGE_LOG
+1007  P1001/SOUTH  U  16.00
+```
+
+All three representations agree.
+
+---
+
+### Sequence Reuse After Rollback
+
+The experiment demonstrates that a sequence number allocated inside an uncommitted transaction does not need to be permanently discarded.
+
+The relevant distinction is:
+
+```text
+attempted EVENT_SEQ
+```
+
+versus:
+
+```text
+committed EVENT_SEQ
+```
+
+If:
+
+```text
+1007
+```
+
+was allocated but the entire producer LUW rolled back, then from the committed event stream's perspective:
+
+```text
+1007 was never published
+```
+
+It can therefore be reused safely.
+
+---
+
+### Gaps Are Not the Main Correctness Issue
+
+A production sequencing mechanism might choose never to reuse sequence values and therefore leave gaps after failures.
+
+For example:
+
+```text
+1006
+1008
+```
+
+with no committed:
+
+```text
+1007
+```
+
+A gap by itself does not necessarily make an ordered event stream incorrect.
+
+The critical property for high-water-mark consumption is:
+
+```text
+a lower event must not appear later
+after the consumer has already advanced
+past a higher committed event
+```
+
+The laboratory uses transactional counter rollback and therefore naturally reuses the failed sequence, but sequence continuity is not the fundamental guarantee.
+
+Commit-consistent ordering is.
+
+---
+
+### Lock Behavior During Failure
+
+The producer still holds:
+
+```text
+EZDBEVCOUNT
+```
+
+while the transaction is being resolved.
+
+On failure, the producer:
+
+```text
+ROLLBACKs
+```
+
+and then releases the lock.
+
+This prevents another producer from allocating a later event while the failed transaction is still unresolved.
+
+The lock and rollback therefore cooperate:
+
+```text
+lock
+-> prevents concurrent ordering violation
+
+ROLLBACK
+-> restores transactional consistency
+```
+
+Again, they solve different problems.
+
+---
+
+### Three-Way Atomicity
+
+The experiment makes the source-side atomicity requirement explicit.
+
+For a producer event `N`, these states must not be committed independently:
+
+```text
+1. producer counter = N
+
+2. business state reflecting event N
+
+3. change-log event N
+```
+
+The valid committed outcomes are:
+
+```text
+all three old
+```
+
+or:
+
+```text
+all three new
+```
+
+A state such as:
+
+```text
+counter new
+business new
+log old
+```
+
+is invalid.
+
+So is:
+
+```text
+counter new
+business old
+log new
+```
+
+or:
+
+```text
+counter old
+business new
+log new
+```
+
+The database LUW prevents these partial outcomes.
+
+---
+
+### Transactional Outbox Principle
+
+Although the laboratory uses its own change-log table, the underlying principle is closely related to a transactional outbox pattern:
+
+```text
+business state
++
+event representation
+```
+
+are committed together.
+
+The important architectural idea is not the specific table name.
+
+It is:
+
+```text
+event publication must be transactionally coupled
+to the business change it represents
+```
+
+Without this coupling, reliable downstream acquisition cannot be guaranteed.
+
+---
+
+### Why the Consumer Cannot Repair a Missing Event
+
+Suppose the business change were allowed to commit without its log event.
+
+The consumer only reads:
+
+```text
+ZDB_CHANGE_LOG
+```
+
+using:
+
+```text
+EVENT_SEQ > LAST_SEQ
+```
+
+It has no general way to discover:
+
+```text
+P1001 changed to 16.00
+but no event was written
+```
+
+The current-state table may contain the new value, but the event consumer does not know that a change is missing.
+
+Therefore:
+
+```text
+producer correctness
+```
+
+must be established before the event reaches the consumer boundary.
+
+A consumer cannot reconstruct arbitrary events that were never published.
+
+---
+
+### Why Retry Is Safe
+
+After rollback:
+
+```text
+business state = old value
+producer counter = old value
+legitimate event absent
+```
+
+The retry therefore starts from a clean committed state.
+
+It does not need to determine which of the previous producer operations partially succeeded.
+
+The database transaction has already resolved that ambiguity.
+
+The retry can simply perform the complete producer operation again.
+
+This greatly simplifies recovery logic.
+
+---
+
+### Consumer View After Retry
+
+Assume the consumer pointer is:
+
+```text
+LAST_SEQ = 1006
+```
+
+After the successful retry, the log contains:
+
+```text
+1007  P1001/SOUTH  U  16.00
+```
+
+The normal consumer rule:
+
+```text
+EVENT_SEQ > 1006
+```
+
+selects the event.
+
+No special recovery logic is needed on the consumer side.
+
+From the consumer's perspective, event `1007` simply appeared as the next correctly ordered committed event.
+
+---
+
+### Producer Failure vs Consumer Failure
+
+The project therefore has two complementary recovery patterns.
+
+Consumer failure:
+
+```text
+source event already committed
+consumer LUW fails
+        |
+        v
+consumer pointer unchanged
+        |
+        v
+event replayed
+```
+
+Producer failure:
+
+```text
+business change and event not yet committed
+producer LUW fails
+        |
+        v
+counter + business state + event rolled back
+        |
+        v
+producer operation retried
+```
+
+The recovery boundaries are different because producer and consumer own different transactions.
+
+---
+
+### End-to-End Reliability Chain
+
+The complete event path can now be expressed as:
+
+```text
+Producer:
+
+lock
+allocate EVENT_SEQ
+change business state
+write event
+COMMIT
+unlock
+
+        |
+        v
+
+durable ordered ZDB_CHANGE_LOG
+
+        |
+        v
+
+Consumer:
+
+read EVENT_SEQ > LAST_SEQ
+persist acquired events
+advance LAST_SEQ
+COMMIT
+```
+
+Correctness requires both sides to maintain their own atomicity guarantees.
+
+---
+
+### Result of the Experiment
+
+The failure experiment starts with:
+
+```text
+Producer counter = 1006
+P1001/SOUTH       = 15.00
+```
+
+A deliberate conflict is created at:
+
+```text
+EVENT_SEQ = 1007
+```
+
+The producer attempts:
+
+```text
+counter 1006 -> 1007
+price   15.00 -> 16.00
+insert legitimate event 1007
+```
+
+The log insert fails.
+
+The producer executes:
+
+```text
+ROLLBACK
+```
+
+and the committed state returns to:
+
+```text
+counter = 1006
+price   = 15.00
+```
+
+After cleanup, the producer retries and successfully commits:
+
+```text
+counter = 1007
+price   = 16.00
+
+1007  P1001/SOUTH  U  16.00
+```
+
+The experiment therefore proves:
+
+```text
+Reliable event publication requires
+the producer counter,
+business change,
+and change-log event
+to share one transactional commit boundary.
+```
+
+The broader principle is:
+
+```text
+No committed business change
+without a committed event,
+and no committed event
+without its corresponding committed business change.
+```
+
+Together with commit-consistent producer ordering and atomic consumer pointer advancement, this completes the core reliability contract of the transactional change-log architecture.
+
+
+
+## Timestamp Delta vs Transactional Change Log
+
+The laboratory implements two fundamentally different delta architectures:
+
+```text
+Timestamp delta on a mutable current-state table
+```
+
+and:
+
+```text
+Transactional delta over an ordered change log
+```
+
+Both can provide reliable acquisition, but they rely on different correctness contracts.
+
+The main difference is not:
+
+```text
+timestamp
+vs
+numeric sequence
+```
+
+The deeper difference is:
+
+```text
+time-based inference of changes
+```
+
+versus:
+
+```text
+explicit transactional publication of changes
+```
+
+---
+
+### Two Different Source Models
+
+Timestamp delta operates directly on:
+
+```text
+current business state
+```
+
+For each business key, the source contains one current row:
+
+```text
+P1001/SOUTH
+PRICE      = 16.00
+CHANGED_AT = T
+```
+
+The consumer infers that a change occurred because:
+
+```text
+CHANGED_AT
+```
+
+falls inside the extraction window.
+
+The transactional change log instead stores explicit events:
+
+```text
+1002  P1001/SOUTH  U  14.00
+1005  P1001/SOUTH  U  15.00
+1007  P1001/SOUTH  U  16.00
+```
+
+The consumer does not infer changes from the current state.
+
+It reads the events directly.
+
+---
+
+### Basis of Correctness
+
+This is the most important distinction.
+
+Timestamp delta relies on a temporal contract:
+
+```text
+Every relevant change updates CHANGED_AT
+
++
+
+source visibility lag is bounded
+
++
+
+safety intervals cover that lag
+
++
+
+deletion remains represented in the source
+```
+
+Transactional change-log delta relies on a transactional and ordering contract:
+
+```text
+Every relevant business change creates an event
+
++
+
+business change and event are committed in one LUW
+
++
+
+EVENT_SEQ publication is commit-order-consistent
+
++
+
+events remain durable until the consumer no longer needs them
+```
+
+The two approaches therefore achieve reliability by different mechanisms.
+
+---
+
+### Comparison
+
+| Criterion | `CHANGED_AT + IS_DELETED` | Transactional Change Log |
+|---|---|---|
+| **Basis of correctness** | Temporal contract: timestamp maintenance and safety intervals must cover source visibility lag | Transactional and ordering contract: business change and event share one LUW, and events are published in commit-consistent order |
+| **Source model** | Mutable current-state table | Current-state table plus durable event stream |
+| **Delta criterion** | `CHANGED_AT` | `EVENT_SEQ` |
+| **Consumer pointer** | `LAST_CHANGED_AT` | `LAST_SEQ` |
+| **Meaning of pointer** | Latest source-time boundary considered safely scanned | Highest event sequence successfully persisted by the consumer |
+| **INSERT** | Visible through new `CHANGED_AT` | Explicit `I` event |
+| **UPDATE** | Visible if every relevant update changes `CHANGED_AT` | Explicit `U` event |
+| **Physical DELETE** | Invisible after row removal | Explicit `D` event |
+| **Delete strategy** | Requires soft delete / tombstone or another retained representation | Physical delete can be represented directly in the event stream |
+| **Ordering** | Time-based; several rows may share one timestamp | Explicit event order through `EVENT_SEQ` |
+| **Delayed COMMIT** | Requires safety interval protection | Safe if producer event publication is commit-order-consistent |
+| **Dependency on transaction duration** | Yes | Not directly for delta correctness |
+| **Upper safety interval** | Required when visibility can lag behind timestamp assignment | Not required for normal sequence-based consumption |
+| **Lower overlap** | Useful for controlled rereading near the boundary | Not normally required |
+| **Duplicate acquisition** | Expected with lower overlap | Normally caused only by retry/reinitialization rather than normal boundary handling |
+| **Intermediate changes** | May disappear because only current state remains | Can be preserved as separate events |
+| **Consumer restart** | Depends on atomic persistence and timestamp pointer update | Depends on atomic persistence and sequence pointer update |
+| **Producer complexity** | Relatively low | Higher |
+| **Consumer boundary logic** | More complex | Simpler |
+| **Retention requirement** | Tombstones may require retention | Event log requires retention |
+| **Scalability concern** | Mainly source query and timestamp-window behavior | Event sequencing and log growth may become bottlenecks |
+
+---
+
+### Timestamp Delta: Correctness Through Time
+
+The timestamp architecture assumes that source time can be divided into safely processed and not-yet-safe regions.
+
+The consumer calculates:
+
+```text
+LOWER_BOUND =
+LAST_CHANGED_AT - LOWER_SAFETY_INTERVAL
+```
+
+and:
+
+```text
+UPPER_BOUND =
+REQUEST_START - UPPER_SAFETY_INTERVAL
+```
+
+then reads:
+
+```text
+LOWER_BOUND < CHANGED_AT <= UPPER_BOUND
+```
+
+The upper boundary protects against recent changes whose transactions may not yet be visible.
+
+The lower boundary intentionally rereads part of the previously scanned region.
+
+The architecture therefore depends on:
+
+```text
+time
+```
+
+as its primary ordering model.
+
+---
+
+### Timestamp Delta Requires Bounded Visibility Lag
+
+Let:
+
+```text
+D
+```
+
+be the maximum time between:
+
+```text
+assigning CHANGED_AT
+```
+
+and:
+
+```text
+the transaction becoming committed and visible
+```
+
+A finite upper safety interval can provide strict protection only if:
+
+```text
+D
+```
+
+is itself bounded.
+
+Conceptually:
+
+```text
+UPPER_SAFETY_INTERVAL >= maximum visibility lag
+```
+
+If the source can occasionally keep transactions open much longer than the configured safety window, the consumer can still move its pointer past an invisible older change.
+
+Therefore:
+
+```text
+finite safety interval
++
+unbounded delayed COMMIT
+=
+no strict lossless guarantee
+```
+
+This is the fundamental limitation of the timestamp model explored by the laboratory.
+
+---
+
+### Change Log: Correctness Through Transaction Order
+
+The change-log architecture replaces this temporal assumption with an ordered publication contract.
+
+A producer performs:
+
+```text
+lock event counter
+        |
+        v
+allocate EVENT_SEQ
+        |
+        v
+update producer counter
+        |
+        v
+apply business change
+        |
+        v
+write change-log event
+        |
+        v
+COMMIT
+        |
+        v
+release lock
+```
+
+The consumer then reads:
+
+```text
+EVENT_SEQ > LAST_SEQ
+ORDER BY EVENT_SEQ
+```
+
+The important guarantee is:
+
+```text
+a later committed sequence
+cannot become visible
+while an earlier required sequence
+is still unresolved
+```
+
+Under this guarantee, the consumer can safely treat:
+
+```text
+EVENT_SEQ
+```
+
+as an exact high-water mark.
+
+---
+
+### Long-Running Transactions
+
+The two architectures behave differently when a source transaction remains open for a long time.
+
+Timestamp architecture:
+
+```text
+transaction gets CHANGED_AT = T1
+        |
+        | remains uncommitted
+        |
+        v
+later timestamp T2 becomes visible
+        |
+        v
+consumer may move beyond T1
+```
+
+Safety intervals reduce this risk only while the transaction delay remains inside the configured timing contract.
+
+Change-log architecture:
+
+```text
+transaction allocates EVENT_SEQ = N
+        |
+        | remains uncommitted
+        |
+        v
+producer ordering prevents N+1
+from being published ahead of N
+```
+
+The long transaction may delay later producers, but it does not cause the consumer to skip event `N`.
+
+Therefore:
+
+```text
+timestamp architecture
+-> transaction duration affects correctness assumptions
+
+change-log architecture
+-> transaction duration primarily affects latency and throughput
+```
+
+---
+
+### Where the Complexity Lives
+
+Timestamp delta keeps the producer relatively simple.
+
+The source only needs to maintain fields such as:
+
+```text
+CHANGED_AT
+IS_DELETED
+```
+
+The complexity appears mainly in the consumer-side extraction contract:
+
+```text
+safety intervals
+overlap
+duplicate handling
+visibility assumptions
+tombstone retention
+```
+
+The change-log architecture moves more complexity to the producer:
+
+```text
+event creation
+event sequencing
+locking
+transactional coupling
+log persistence
+log retention
+```
+
+The consumer then becomes simpler:
+
+```text
+EVENT_SEQ > LAST_SEQ
+```
+
+This is an architectural trade-off rather than a universally better or worse design.
+
+---
+
+### Current State vs Event History
+
+Timestamp delta is naturally aligned with:
+
+```text
+current-state synchronization
+```
+
+The main question is:
+
+```text
+What should the target state be now?
+```
+
+Intermediate source changes may disappear before the consumer reads them.
+
+For example:
+
+```text
+10.00
+-> 12.00
+-> 15.00
+```
+
+may result in the consumer receiving only:
+
+```text
+15.00
+```
+
+This can be completely correct for current-state replication.
+
+The change log can preserve:
+
+```text
+10.00
+-> 12.00
+-> 15.00
+```
+
+as separate events.
+
+It is therefore more appropriate when the consumer requires:
+
+```text
+operation history
+strict change order
+auditability
+event-level processing
+```
+
+---
+
+### Delete Semantics
+
+Deletion highlights the difference between the models especially clearly.
+
+Timestamp current-state source:
+
+```text
+physical DELETE
+-> row disappears
+-> no CHANGED_AT remains
+-> delete invisible
+```
+
+Therefore the source must retain a tombstone:
+
+```text
+IS_DELETED = X
+CHANGED_AT = new timestamp
+```
+
+The change-log architecture instead records:
+
+```text
+EVENT_SEQ = N
+OPERATION = D
+```
+
+The current-state row can then be physically removed.
+
+Delete information remains durable independently of the business row.
+
+---
+
+### Duplicate Delivery
+
+Timestamp delta with lower overlap intentionally permits repeated after-images:
+
+```text
+Run A:
+P1002/SOUTH = 23.00
+
+Run B:
+P1002/SOUTH = 23.00
+```
+
+This is compatible with overwrite-style or otherwise idempotent processing.
+
+The change-log consumer does not need routine overlap.
+
+If:
+
+```text
+LAST_SEQ = 1004
+```
+
+the next normal request begins exactly at:
+
+```text
+EVENT_SEQ > 1004
+```
+
+A source event can still be replayed after consumer failure if `LAST_SEQ` was not committed, but this is restart behavior rather than normal boundary overlap.
+
+---
+
+### Consumer Restart Is Similar in Both Models
+
+Despite their different source semantics, both architectures follow the same fundamental consumer transaction rule:
+
+```text
+persist acquired data
+        |
+        v
+advance delta pointer
+        |
+        v
+COMMIT
+```
+
+The pointer must never be committed before the corresponding acquisition data.
+
+For timestamp delta:
+
+```text
+pointer = LAST_CHANGED_AT
+```
+
+For change-log delta:
+
+```text
+pointer = LAST_SEQ
+```
+
+The pointer type differs, but the atomicity principle is the same.
+
+---
+
+### Producer Atomicity Is Unique to the Change Log
+
+Timestamp delta usually relies on the source application updating:
+
+```text
+business state
++
+CHANGED_AT
+```
+
+correctly.
+
+The transactional event architecture has an additional explicit producer obligation:
+
+```text
+business state
++
+event sequence
++
+event record
+```
+
+must commit together.
+
+This requirement is stronger but gives the consumer a durable event representation.
+
+If event creation fails:
+
+```text
+business change must roll back
+```
+
+or the event stream no longer represents the committed business state reliably.
+
+---
+
+### Unbounded Transaction Duration
+
+This is the strongest difference demonstrated by the laboratory.
+
+Suppose source transaction duration cannot be reliably bounded.
+
+Timestamp approach:
+
+```text
+No practical finite safety interval
+can prove that every timestamp
+behind the pointer is already visible.
+```
+
+Transactional change log:
+
+```text
+An unresolved earlier event prevents
+later sequence publication,
+so the consumer cannot advance past it.
+```
+
+This makes the change-log architecture stronger when strict lossless acquisition is required and source transaction duration is unpredictable.
+
+The trade-off is producer serialization and greater infrastructure complexity.
+
+---
+
+### Change Log Is Not Automatically Better
+
+The transactional change log should not be interpreted as the universally preferred design.
+
+Timestamp delta can be simpler and entirely appropriate when:
+
+```text
+the source is naturally current-state oriented
+
+CHANGED_AT is maintained reliably
+
+source transaction duration is bounded
+
+safety-window latency is acceptable
+
+soft-delete semantics are available
+
+duplicate after-images are acceptable
+```
+
+In such a system, introducing a full transactional event log may add unnecessary complexity.
+
+---
+
+### When Timestamp Delta Is a Good Fit
+
+Timestamp delta is a strong candidate when:
+
+```text
+1. The consumer primarily needs current state.
+
+2. Every relevant INSERT and UPDATE
+   reliably updates CHANGED_AT.
+
+3. Physical deletes can be represented
+   through tombstones or another retained marker.
+
+4. Maximum visibility lag is known and bounded.
+
+5. Safety intervals can be configured
+   without unacceptable latency.
+
+6. Downstream processing tolerates
+   repeated after-images caused by overlap.
+```
+
+Under these conditions, timestamp delta can provide a practical and relatively simple solution.
+
+---
+
+### When Transactional Change Log Is a Good Fit
+
+A transactional change log becomes more attractive when:
+
+```text
+1. Every business operation must be preserved.
+
+2. Physical deletes must be propagated explicitly.
+
+3. Strict event ordering matters.
+
+4. Source transaction duration may be unpredictable.
+
+5. Consumers require durable replay.
+
+6. The source can transactionally couple
+   business changes with event creation.
+
+7. The additional producer complexity
+   and event-log storage are acceptable.
+```
+
+In this case, the explicit event stream provides stronger semantics.
+
+---
+
+### Different Meanings of "Delta"
+
+The project therefore demonstrates that the word:
+
+```text
+delta
+```
+
+can describe very different things.
+
+Creation-sequence delta asks:
+
+```text
+Which rows were created after the pointer?
+```
+
+Timestamp delta asks:
+
+```text
+Which current rows were marked as changed
+inside this source-time window?
+```
+
+Transactional change-log delta asks:
+
+```text
+Which ordered business events occurred
+after this event sequence?
+```
+
+These are not equivalent questions.
+
+The correct acquisition design depends on which question the integration actually needs to answer.
+
+---
+
+### Pointer Meaning
+
+The same distinction appears in the persistent pointers.
+
+Numeric creation delta:
+
+```text
+LAST_SEQ
+-> highest creation sequence processed
+```
+
+Timestamp delta:
+
+```text
+LAST_CHANGED_AT
+-> latest source-time frontier considered safely scanned
+```
+
+Change-log delta:
+
+```text
+LAST_SEQ
+-> highest event sequence durably acknowledged by the consumer
+```
+
+A pointer is therefore meaningful only together with the source semantics behind it.
+
+---
+
+### Core Correctness Question
+
+Across both architectures, the central question remains:
+
+```text
+When is it safe to advance the consumer pointer?
+```
+
+For timestamp delta, the answer is:
+
+```text
+when the source-time region before the new boundary
+is old enough that all relevant transactions
+are guaranteed to be visible,
+with configured overlap where required
+```
+
+For transactional change-log delta:
+
+```text
+when all events up to the new sequence
+are already committed in safe publication order
+and have been durably persisted by the consumer
+```
+
+---
+
+### Reliability Contracts
+
+The complete timestamp contract can be summarized as:
+
+```text
+Every relevant change updates CHANGED_AT
+
++
+
+DELETE remains represented through a tombstone
+or another extractable source record
+
++
+
+visibility lag is bounded
+
++
+
+UPPER_SAFETY_INTERVAL covers that lag
+
++
+
+LOWER_SAFETY_INTERVAL provides controlled overlap
+
++
+
+downstream processing tolerates repeated after-images
+
++
+
+acquisition persistence and pointer advancement
+are committed atomically
+```
+
+The complete transactional change-log contract is:
+
+```text
+Every relevant business change creates an event
+
++
+
+business change, event counter,
+and event record share one LUW
+
++
+
+all producers follow the same sequencing protocol
+
++
+
+EVENT_SEQ publication is commit-order-consistent
+
++
+
+events remain durable until consumers no longer need them
+
++
+
+acquisition persistence and consumer LAST_SEQ
+are committed atomically
+```
+
+---
+
+### Final Comparison
+
+The timestamp architecture protects the consumer by saying:
+
+```text
+Do not trust source time too quickly.
+```
+
+The transactional change-log architecture protects the consumer by saying:
+
+```text
+Do not publish a later event
+before an earlier event is transactionally resolved.
+```
+
+The first strategy manages uncertainty through:
+
+```text
+time delay
++
+overlap
+```
+
+The second manages it through:
+
+```text
+transactional coupling
++
+ordered publication
+```
+
+This is the central architectural distinction demonstrated by the laboratory.
+
+---
+
+### Final Principle
+
+The experiments lead to one general rule:
+
+```text
+A delta pointer may advance only when
+all relevant source changes before that boundary
+are either:
+
+1. already durably acquired,
+
+or
+
+2. guaranteed to remain recoverable
+   by a future request.
+```
+
+Timestamp delta satisfies this rule through a bounded time-based safety contract.
+
+Transactional change-log delta satisfies it through durable ordered events and transactional sequencing.
+
+The choice between them should therefore be based not on the technical type of the delta field, but on the guarantees that the source system can actually provide.
