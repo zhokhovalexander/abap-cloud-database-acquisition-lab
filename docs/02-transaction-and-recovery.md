@@ -3806,3 +3806,1027 @@ and:
 ```text
 acknowledged processing
 ```
+## Producer Locking and Event Ordering
+
+Producer transaction atomicity guarantees that one producer operation is internally consistent.
+
+It does not by itself guarantee that multiple concurrent producer transactions become visible in the same order in which their event numbers were allocated.
+
+This distinction is critical because the consumer uses:
+
+```text
+EVENT_SEQ
+```
+
+as a high-water-mark delta field.
+
+For that pointer to be safe, event publication order must be compatible with sequence order.
+
+---
+
+### Why Atomicity Alone Is Not Enough
+
+Consider two concurrent producer sessions.
+
+Session A allocates:
+
+```text
+EVENT_SEQ = 1002
+```
+
+Session B later allocates:
+
+```text
+EVENT_SEQ = 1003
+```
+
+Each transaction may be perfectly atomic.
+
+However, if Session B commits first, the event stream can temporarily become:
+
+```text
+1003
+-> committed and visible
+
+1002
+-> still uncommitted and invisible
+```
+
+A consumer starting from:
+
+```text
+LAST_SEQ = 1001
+```
+
+could then select:
+
+```text
+1003
+```
+
+and advance:
+
+```text
+LAST_SEQ = 1003
+```
+
+If Session A commits afterwards, event:
+
+```text
+1002
+```
+
+appears behind the consumer pointer and is no longer eligible for:
+
+```text
+EVENT_SEQ > LAST_SEQ
+```
+
+The event is lost from the consumer's perspective.
+
+---
+
+### The Required Ordering Property
+
+The event stream therefore needs a stronger invariant than:
+
+```text
+EVENT_SEQ is monotonically increasing
+```
+
+The required property is:
+
+```text
+lower EVENT_SEQ values
+must be transactionally resolved
+before higher EVENT_SEQ values
+can become visible
+```
+
+For the laboratory's single ordered stream, the intended relationship is:
+
+```text
+allocation order
+=
+commit order
+=
+visibility order
+```
+
+This is what makes:
+
+```text
+EVENT_SEQ
+```
+
+safe as a consumer high-water mark.
+
+---
+
+### Event Counter Serialization
+
+The producer sequence is stored in:
+
+```text
+ZDB_EVENT_COUNT
+```
+
+for:
+
+```text
+SOURCE_NAME = PRODUCT_PRICE_LOG
+```
+
+The current producer position is:
+
+```text
+LAST_EVENT_SEQ
+```
+
+The laboratory protects this counter with lock object:
+
+```text
+EZDBEVCOUNT
+```
+
+The lock is acquired before reading and advancing the counter.
+
+Conceptually:
+
+```text
+acquire lock
+        |
+        v
+read LAST_EVENT_SEQ
+        |
+        v
+allocate next EVENT_SEQ
+        |
+        v
+update counter
+        |
+        v
+apply business change
+        |
+        v
+write change-log event
+        |
+        v
+COMMIT / ROLLBACK
+        |
+        v
+release lock
+```
+
+Only one producer for the same logical stream can execute this sequence at a time.
+
+---
+
+### Why the Lock Covers More Than the Counter Update
+
+It would not be enough to lock only while calculating the next sequence.
+
+For example:
+
+```text
+LOCK
+allocate 1002
+update counter
+UNLOCK
+```
+
+followed by:
+
+```text
+business change
+write event
+COMMIT
+```
+
+would still allow another producer to:
+
+```text
+LOCK
+allocate 1003
+UNLOCK
+COMMIT 1003
+```
+
+before event `1002` commits.
+
+The sequence numbers would remain unique, but commit order could still differ from allocation order.
+
+Therefore the lock must remain held while the event is transactionally unresolved.
+
+---
+
+### Lock Held Until Transaction Resolution
+
+The laboratory keeps the lock through:
+
+```text
+sequence allocation
+business change
+event insertion
+```
+
+and releases it only after:
+
+```text
+COMMIT
+```
+
+or:
+
+```text
+ROLLBACK
+```
+
+has resolved the producer transaction.
+
+Conceptually:
+
+```text
+LOCK
+ |
+ +-- allocate EVENT_SEQ
+ |
+ +-- update counter
+ |
+ +-- modify business state
+ |
+ +-- insert change-log event
+ |
+ +-- COMMIT / ROLLBACK
+ |
+UNLOCK
+```
+
+This prevents another producer from publishing a later event while the current event is still undecided.
+
+---
+
+### Two-Session Concurrency Experiment
+
+The laboratory verifies this behavior using two independent ADT sessions.
+
+Assume the committed producer counter is:
+
+```text
+LAST_EVENT_SEQ = 1001
+```
+
+Session A starts a producer update.
+
+It acquires:
+
+```text
+EZDBEVCOUNT
+```
+
+and allocates:
+
+```text
+EVENT_SEQ = 1002
+```
+
+The producer then:
+
+```text
+updates the counter
+applies the business change
+inserts event 1002
+```
+
+but execution is paused before:
+
+```text
+COMMIT
+```
+
+At this point:
+
+```text
+1002
+```
+
+exists only inside Session A's uncommitted LUW.
+
+The lock is still held.
+
+---
+
+### Concurrent Session B
+
+While Session A is paused, Session B starts another producer.
+
+Session B attempts to acquire:
+
+```text
+EZDBEVCOUNT
+```
+
+for the same logical source.
+
+The lock attempt fails because Session A still owns the lock.
+
+Session B therefore does not:
+
+```text
+read a newer committed counter
+allocate 1003
+modify business state
+write another log event
+```
+
+No later event can be published while `1002` remains unresolved.
+
+---
+
+### Session A Commits
+
+Session A is resumed and executes:
+
+```text
+COMMIT
+```
+
+The following become durable together:
+
+```text
+LAST_EVENT_SEQ = 1002
+business change for event 1002
+change-log event 1002
+```
+
+The lock is then released.
+
+The committed event stream now ends at:
+
+```text
+1002
+```
+
+---
+
+### Session B Retries
+
+Session B retries after the lock is released.
+
+It now reads:
+
+```text
+LAST_EVENT_SEQ = 1002
+```
+
+and allocates:
+
+```text
+EVENT_SEQ = 1003
+```
+
+It performs its complete producer transaction and commits.
+
+The durable stream becomes:
+
+```text
+1002
+1003
+```
+
+The observed order is therefore:
+
+```text
+allocation:
+1002 -> 1003
+
+commit:
+1002 -> 1003
+
+visibility:
+1002 -> 1003
+```
+
+This is the ordering required by the consumer high-water mark.
+
+---
+
+### Why a Later Producer Is Rejected Instead of Queued
+
+In the laboratory, a conflicting producer receives a lock error and exits.
+
+A production implementation could instead:
+
+```text
+wait
+retry automatically
+queue the request
+```
+
+The exact contention policy is secondary.
+
+The correctness requirement is simply:
+
+```text
+do not publish a higher EVENT_SEQ
+while a lower allocated sequence is unresolved
+```
+
+The laboratory uses explicit rejection because it makes the concurrency behavior easy to observe.
+
+---
+
+### Long-Running Producer Transactions
+
+If one producer remains open for a long time, the lock remains held.
+
+Later producers are therefore delayed.
+
+For example:
+
+```text
+Session A
+EVENT_SEQ = 1002
+transaction open for 10 minutes
+```
+
+means that no later producer can publish:
+
+```text
+1003
+```
+
+during those 10 minutes.
+
+This affects:
+
+```text
+latency
+throughput
+producer concurrency
+```
+
+but preserves:
+
+```text
+delta correctness
+```
+
+The architecture deliberately trades producer parallelism for a simple globally ordered event stream.
+
+---
+
+### Difference from Timestamp Delta
+
+The delayed-transaction problem also appears in timestamp acquisition, but the protection mechanism is different.
+
+Timestamp delta allows producers to proceed independently.
+
+The consumer protects itself with:
+
+```text
+UPPER_SAFETY_INTERVAL
+```
+
+and optionally:
+
+```text
+LOWER_SAFETY_INTERVAL
+```
+
+The change-log architecture instead constrains the producer side.
+
+Conceptually:
+
+```text
+Timestamp delta:
+
+producer timing may vary
+        |
+        v
+consumer delays trust in recent time
+```
+
+versus:
+
+```text
+Change-log delta:
+
+producer publication is serialized
+        |
+        v
+consumer can trust EVENT_SEQ order
+```
+
+---
+
+### Locking and Atomicity Solve Different Problems
+
+It is important to keep these mechanisms conceptually separate.
+
+Transaction atomicity guarantees:
+
+```text
+counter
++
+business state
++
+event
+```
+
+commit or roll back together.
+
+Locking guarantees:
+
+```text
+another producer cannot publish
+a later sequence
+while the current event is unresolved
+```
+
+Atomicity protects:
+
+```text
+consistency inside one producer transaction
+```
+
+Locking protects:
+
+```text
+ordering between producer transactions
+```
+
+Both are necessary.
+
+---
+
+### Atomic but Incorrect Ordering
+
+Consider two perfectly atomic transactions:
+
+```text
+Transaction A:
+1002
+business change A
+event 1002
+COMMIT
+```
+
+and:
+
+```text
+Transaction B:
+1003
+business change B
+event 1003
+COMMIT
+```
+
+If B commits first, each transaction is internally correct.
+
+Yet the combined event stream is unsafe for:
+
+```text
+LAST_SEQ
+```
+
+because:
+
+```text
+1003
+```
+
+can become visible before:
+
+```text
+1002
+```
+
+Atomicity alone therefore does not imply safe global ordering.
+
+---
+
+### Monotonic Sequence Alone Is Also Insufficient
+
+Likewise, a counter that always returns:
+
+```text
+1001
+1002
+1003
+1004
+```
+
+does not guarantee a safe stream.
+
+The important question is not only:
+
+```text
+Are numbers unique and increasing?
+```
+
+but:
+
+```text
+Can a higher committed number become visible
+while a lower required number is still uncommitted?
+```
+
+If the answer is yes, a simple high-water-mark consumer is unsafe.
+
+---
+
+### Producer Ordering Invariant
+
+For the laboratory stream, the ordering invariant can be stated as:
+
+```text
+If committed event N is visible,
+then every required event with EVENT_SEQ < N
+has already been transactionally resolved.
+```
+
+For the current implementation, resolution means:
+
+```text
+committed
+```
+
+or:
+
+```text
+rolled back and therefore never published
+```
+
+No unresolved lower sequence may remain behind a visible higher sequence.
+
+---
+
+### Rollback and Ordering
+
+Suppose Session A allocates:
+
+```text
+1002
+```
+
+but its transaction fails.
+
+Because the event counter update is part of the same LUW:
+
+```text
+ROLLBACK
+```
+
+restores:
+
+```text
+LAST_EVENT_SEQ = 1001
+```
+
+The failed `1002` never becomes part of the committed stream.
+
+After the lock is released, the next producer may allocate:
+
+```text
+1002
+```
+
+again.
+
+This preserves both:
+
+```text
+atomicity
+```
+
+and:
+
+```text
+ordered publication
+```
+
+---
+
+### Sequence Gaps
+
+A production sequence implementation may choose not to reuse numbers after failed attempts.
+
+For example, a durable stream could contain:
+
+```text
+1001
+1003
+1004
+```
+
+with no event `1002`.
+
+A gap is not automatically a correctness problem.
+
+The consumer can still safely advance from:
+
+```text
+1001
+```
+
+to:
+
+```text
+1003
+```
+
+if the source contract guarantees that:
+
+```text
+1002 can never appear later
+```
+
+The critical property is therefore not perfect numerical continuity.
+
+It is final ordering.
+
+---
+
+### No Late Appearance Behind the Pointer
+
+The strongest consumer-facing rule is:
+
+```text
+Once the consumer safely advances to EVENT_SEQ = N,
+no new required committed event with EVENT_SEQ <= N
+may appear later.
+```
+
+The producer locking protocol exists specifically to guarantee this property for the laboratory stream.
+
+---
+
+### Lock Scope
+
+The lock key contains:
+
+```text
+CLIENT
+SOURCE_NAME
+```
+
+This means serialization is scoped to one logical source stream.
+
+For:
+
+```text
+PRODUCT_PRICE_LOG
+```
+
+all producers share one event counter and one ordering domain.
+
+A different source name could theoretically use an independent counter and independent lock scope.
+
+This allows separate streams to progress independently.
+
+---
+
+### Single Global Order Within the Stream
+
+Because the laboratory uses one counter for:
+
+```text
+PRODUCT_PRICE_LOG
+```
+
+all events receive one total order:
+
+```text
+1001
+1002
+1003
+1004
+...
+```
+
+This makes consumer processing simple:
+
+```text
+one LAST_SEQ
+one ORDER BY EVENT_SEQ
+one high-water mark
+```
+
+The cost is producer serialization.
+
+---
+
+### Scalability Trade-Off
+
+A single serialized event counter may become a bottleneck at high event volume.
+
+Potential production alternatives include:
+
+```text
+database-native CDC
+log sequence numbers
+partitioned event streams
+transactional outbox processing
+message-broker offsets
+```
+
+Such systems may provide stronger scalability while preserving ordering within defined partitions.
+
+The laboratory intentionally uses a simpler model because the goal is to make the correctness requirement directly observable.
+
+---
+
+### Partitioned Ordering
+
+A scalable system may not require one global order.
+
+For example:
+
+```text
+Partition A:
+1
+2
+3
+
+Partition B:
+1
+2
+3
+```
+
+Each partition could have its own consumer pointer.
+
+However, a consumer could no longer use one global:
+
+```text
+LAST_SEQ
+```
+
+for the complete source.
+
+It would need:
+
+```text
+LAST_SEQ_A
+LAST_SEQ_B
+```
+
+or equivalent partition-aware state.
+
+This complexity is outside the current project scope.
+
+---
+
+### All Producers Must Follow the Protocol
+
+The lock guarantee is only as strong as producer compliance.
+
+Every writer that publishes events to:
+
+```text
+PRODUCT_PRICE_LOG
+```
+
+must use the same protocol.
+
+If one producer bypasses:
+
+```text
+EZDBEVCOUNT
+```
+
+and directly writes a later event, the ordering invariant can be broken.
+
+Therefore the source-side contract includes:
+
+```text
+All producers of one logical event stream
+must use the same sequence-allocation
+and publication-order protocol.
+```
+
+---
+
+### Consumer Benefit
+
+Because the producer guarantees commit-consistent ordering, the consumer does not need:
+
+```text
+upper safety intervals
+lower overlap
+time-based boundary heuristics
+```
+
+The consumer can use the exact sequence condition:
+
+```text
+EVENT_SEQ > LAST_SEQ
+ORDER BY EVENT_SEQ
+```
+
+and safely advance:
+
+```text
+LAST_SEQ
+```
+
+after successful persistence.
+
+The complexity has moved from consumer boundary logic to producer publication discipline.
+
+---
+
+### Result of the Laboratory Experiment
+
+The concurrency experiment starts with:
+
+```text
+LAST_EVENT_SEQ = 1001
+```
+
+Session A:
+
+```text
+acquires EZDBEVCOUNT
+allocates 1002
+prepares business change
+writes event 1002
+pauses before COMMIT
+```
+
+Session B:
+
+```text
+attempts to acquire EZDBEVCOUNT
+fails because Session A still holds the lock
+does not allocate 1003
+```
+
+Session A:
+
+```text
+COMMIT
+release lock
+```
+
+Session B retries:
+
+```text
+reads LAST_EVENT_SEQ = 1002
+allocates 1003
+COMMIT
+```
+
+The final committed stream is:
+
+```text
+1002
+1003
+```
+
+in the same order in which the events became visible.
+
+---
+
+### Core Conclusion
+
+Safe sequence-based delta requires more than:
+
+```text
+monotonically increasing EVENT_SEQ
+```
+
+It requires:
+
+```text
+monotonic event identity
++
+transactional producer atomicity
++
+commit-consistent publication ordering
+```
+
+The lock object:
+
+```text
+EZDBEVCOUNT
+```
+
+provides the ordering part of that contract for the laboratory.
+
+The resulting guarantee is:
+
+```text
+A higher EVENT_SEQ cannot become visible
+while a lower required EVENT_SEQ
+is still transactionally unresolved.
+```
+
+That guarantee is what makes:
+
+```text
+LAST_SEQ
+```
+
+a safe consumer high-water mark.
